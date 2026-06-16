@@ -275,7 +275,8 @@ async function removeNewsletterReactConfig(jid) {
     await initMongo();
     await newsletterReactsCol.deleteOne({ jid });
     console.log(`Removed react-config for ${jid}`);
-  } catch (e) console.error('removeNewsletterReactConfig', e); throw e;
+  } catch (e) { console.error('removeNewsletterReactConfig', e); throw e; }
+
 }
 
 async function listNewsletterReactsFromMongo() {
