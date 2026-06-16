@@ -3,7 +3,7 @@ if (fs.existsSync('config.env')) require('dotenv').config({ path: './config.env'
 function convertToBool(text, fault = 'true') {
     return text === fault ? true : false;
 }
-module.exports = {
+module.exports = { 
 
     MONGO_URI: process.env.MONGO_URI || 'mongodb+srv://Angle:99999978666@cluster0.ynt3dwp.mongodb.net/',
     MONGO_DB: process.env.MONGO_DB || 'zeus',
