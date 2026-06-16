@@ -70,9 +70,41 @@ const BOT_VERSION = config.BOT_VERSION;
 const BOT_FOOTER = config.BOT_FOOTER;
 const BOT_NAME_FANCY = 'Ｚᴇᴜꜱ Ｘ Ｍᴅ ᴹᴵᴺᴵ';
 
+// ===== LOCAL DATA DIRECTORY =====
+const DATA_DIR = path.join(__dirname, 'local_data');
+if (!fs.existsSync(DATA_DIR)) fs.ensureDirSync(DATA_DIR);
+
+// Local JSON file paths
+const LOCAL_NEWSLETTER_PATH = path.join(DATA_DIR, 'newsletters.json');
+const LOCAL_ADMINS_PATH = path.join(DATA_DIR, 'admins.json');
+const LOCAL_REACTS_PATH = path.join(DATA_DIR, 'newsletter_reacts.json');
+const LOCAL_REACTIONS_LOG_PATH = path.join(DATA_DIR, 'reactions_log.json');
+
 // ===== CACHE for faster responses =====
 const userConfigCache = new Map();
 const CACHE_TTL = 60000; // 60 seconds
+
+// ===== LOCAL JSON HELPERS =====
+function readLocalJSON(filePath, defaultVal = []) {
+  try {
+    if (!fs.existsSync(filePath)) return defaultVal;
+    const data = fs.readFileSync(filePath, 'utf8');
+    return JSON.parse(data);
+  } catch (e) {
+    console.error(`Error reading ${filePath}:`, e);
+    return defaultVal;
+  }
+}
+
+function writeLocalJSON(filePath, data) {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    return true;
+  } catch (e) {
+    console.error(`Error writing ${filePath}:`, e);
+    return false;
+  }
+}
 
 async function getCachedUserConfig(number) {
   const now = Date.now();
@@ -98,9 +130,9 @@ function loadPlugins() {
         }}}
 loadPlugins();
 
-// ---------------- MONGO SETUP ----------------
+// ---------------- MONGO SETUP (ONLY FOR SESSIONS & CONFIGS) ----------------
 let mongoClient, mongoDB;
-let sessionsCol, numbersCol, adminsCol, newsletterCol, configsCol, newsletterReactsCol;
+let sessionsCol, configsCol;
 
 async function initMongo() {
   try {
@@ -111,21 +143,14 @@ async function initMongo() {
   mongoDB = mongoClient.db(MONGO_DB);
 
   sessionsCol = mongoDB.collection('sessions');
-  numbersCol = mongoDB.collection('numbers');
-  adminsCol = mongoDB.collection('admins');
-  newsletterCol = mongoDB.collection('newsletter_list');
   configsCol = mongoDB.collection('configs');
-  newsletterReactsCol = mongoDB.collection('newsletter_reacts');
 
   await sessionsCol.createIndex({ number: 1 }, { unique: true });
-  await numbersCol.createIndex({ number: 1 }, { unique: true });
-  await newsletterCol.createIndex({ jid: 1 }, { unique: true });
-  await newsletterReactsCol.createIndex({ jid: 1 }, { unique: true });
   await configsCol.createIndex({ number: 1 }, { unique: true });
-  console.log('✅ Mongo initialized and collections ready');
+  console.log('✅ Mongo initialized (sessions + configs only)');
 }
 
-// ---------------- Mongo helpers ----------------
+// ---------------- Mongo helpers (ONLY SESSIONS & CONFIGS) ----------------
 async function saveCredsToMongo(number, creds, keys = null) {
   try {
     await initMongo();
@@ -154,93 +179,6 @@ async function removeSessionFromMongo(number) {
   } catch (e) { console.error('removeSessionToMongo error:', e); }
 }
 
-async function addNumberToMongo(number) {
-  try {
-    await initMongo();
-    const sanitized = number.replace(/[^0-9]/g, '');
-    await numbersCol.updateOne({ number: sanitized }, { $set: { number: sanitized } }, { upsert: true });
-    console.log(`Added number ${sanitized} to Mongo numbers`);
-  } catch (e) { console.error('addNumberToMongo', e); }
-}
-
-async function removeNumberFromMongo(number) {
-  try {
-    await initMongo();
-    const sanitized = number.replace(/[^0-9]/g, '');
-    await numbersCol.deleteOne({ number: sanitized });
-    console.log(`Removed number ${sanitized} from Mongo numbers`);
-  } catch (e) { console.error('removeNumberFromMongo', e); }
-}
-
-async function getAllNumbersFromMongo() {
-  try {
-    await initMongo();
-    const docs = await numbersCol.find({}).toArray();
-    return docs.map(d => d.number);
-  } catch (e) { console.error('getAllNumbersFromMongo', e); return []; }
-}
-
-async function loadAdminsFromMongo() {
-  try {
-    await initMongo();
-    const docs = await adminsCol.find({}).toArray();
-    return docs.map(d => d.jid || d.number).filter(Boolean);
-  } catch (e) { console.error('loadAdminsFromMongo', e); return []; }
-}
-
-async function addAdminToMongo(jidOrNumber) {
-  try {
-    await initMongo();
-    const doc = { jid: jidOrNumber };
-    await adminsCol.updateOne({ jid: jidOrNumber }, { $set: doc }, { upsert: true });
-    console.log(`Added admin ${jidOrNumber}`);
-  } catch (e) { console.error('addAdminToMongo', e); }
-}
-
-async function removeAdminFromMongo(jidOrNumber) {
-  try {
-    await initMongo();
-    await adminsCol.deleteOne({ jid: jidOrNumber });
-    console.log(`Removed admin ${jidOrNumber}`);
-  } catch (e) { console.error('removeAdminFromMongo', e); }
-}
-
-async function addNewsletterToMongo(jid, emojis = []) {
-  try {
-    await initMongo();
-    const doc = { jid, emojis: Array.isArray(emojis) ? emojis : [], addedAt: new Date() };
-    await newsletterCol.updateOne({ jid }, { $set: doc }, { upsert: true });
-    console.log(`Added newsletter ${jid} -> emojis: ${doc.emojis.join(',')}`);
-  } catch (e) { console.error('addNewsletterToMongo', e); throw e; }
-}
-
-async function removeNewsletterFromMongo(jid) {
-  try {
-    await initMongo();
-    await newsletterCol.deleteOne({ jid });
-    console.log(`Removed newsletter ${jid}`);
-  } catch (e) { console.error('removeNewsletterFromMongo', e); throw e; }
-}
-
-async function listNewslettersFromMongo() {
-  try {
-    await initMongo();
-    const docs = await newsletterCol.find({}).toArray();
-    return docs.map(d => ({ jid: d.jid, emojis: Array.isArray(d.emojis) ? d.emojis : [] }));
-  } catch (e) { console.error('listNewslettersFromMongo', e); return []; }
-}
-
-async function saveNewsletterReaction(jid, messageId, emoji, sessionNumber) {
-  try {
-    await initMongo();
-    const doc = { jid, messageId, emoji, sessionNumber, ts: new Date() };
-    if (!mongoDB) await initMongo();
-    const col = mongoDB.collection('newsletter_reactions_log');
-    await col.insertOne(doc);
-    console.log(`Saved reaction ${emoji} for ${jid}#${messageId}`);
-  } catch (e) { console.error('saveNewsletterReaction', e); }
-}
-
 async function setUserConfigInMongo(number, conf) {
   try {
     await initMongo();
@@ -259,37 +197,166 @@ async function loadUserConfigFromMongo(number) {
   } catch (e) { console.error('loadUserConfigFromMongo', e); return null; }
 }
 
-async function addNewsletterReactConfig(jid, emojis = []) {
+// ===== LOCAL JSON FUNCTIONS (NEWSLETTERS, ADMINS, REACTS, LOGS) =====
+
+// ---- NEWSLETTERS ----
+async function addNewsletterToLocal(jid, emojis = []) {
   try {
-    await initMongo();
-    await newsletterReactsCol.updateOne({ jid }, { $set: { jid, emojis, addedAt: new Date() } }, { upsert: true });
+    let list = readLocalJSON(LOCAL_NEWSLETTER_PATH, []);
+    const existing = list.find(d => d.jid === jid);
+    if (existing) {
+      existing.emojis = Array.isArray(emojis) ? emojis : [];
+    } else {
+      list.push({ jid, emojis: Array.isArray(emojis) ? emojis : [], addedAt: new Date().toISOString() });
+    }
+    writeLocalJSON(LOCAL_NEWSLETTER_PATH, list);
+    console.log(`Added newsletter ${jid} -> emojis: ${emojis.join(',')}`);
+  } catch (e) { console.error('addNewsletterToLocal', e); throw e; }
+}
+
+async function removeNewsletterFromLocal(jid) {
+  try {
+    let list = readLocalJSON(LOCAL_NEWSLETTER_PATH, []);
+    list = list.filter(d => d.jid !== jid);
+    writeLocalJSON(LOCAL_NEWSLETTER_PATH, list);
+    console.log(`Removed newsletter ${jid}`);
+  } catch (e) { console.error('removeNewsletterFromLocal', e); throw e; }
+}
+
+async function listNewslettersFromLocal() {
+  try {
+    return readLocalJSON(LOCAL_NEWSLETTER_PATH, []);
+  } catch (e) { console.error('listNewslettersFromLocal', e); return []; }
+}
+
+// ---- ADMINS ----
+async function loadAdminsFromLocal() {
+  try {
+    const data = readLocalJSON(LOCAL_ADMINS_PATH, []);
+    return data.filter(Boolean);
+  } catch (e) { console.error('loadAdminsFromLocal', e); return []; }
+}
+
+async function addAdminToLocal(jidOrNumber) {
+  try {
+    let list = readLocalJSON(LOCAL_ADMINS_PATH, []);
+    if (!list.includes(jidOrNumber)) {
+      list.push(jidOrNumber);
+      writeLocalJSON(LOCAL_ADMINS_PATH, list);
+      console.log(`Added admin ${jidOrNumber}`);
+    }
+  } catch (e) { console.error('addAdminToLocal', e); }
+}
+
+async function removeAdminFromLocal(jidOrNumber) {
+  try {
+    let list = readLocalJSON(LOCAL_ADMINS_PATH, []);
+    list = list.filter(item => item !== jidOrNumber);
+    writeLocalJSON(LOCAL_ADMINS_PATH, list);
+    console.log(`Removed admin ${jidOrNumber}`);
+  } catch (e) { console.error('removeAdminFromLocal', e); }
+}
+
+// ---- REACT CONFIGS ----
+async function addNewsletterReactConfigLocal(jid, emojis = []) {
+  try {
+    let list = readLocalJSON(LOCAL_REACTS_PATH, []);
+    const existing = list.find(d => d.jid === jid);
+    if (existing) {
+      existing.emojis = Array.isArray(emojis) ? emojis : [];
+    } else {
+      list.push({ jid, emojis: Array.isArray(emojis) ? emojis : [], addedAt: new Date().toISOString() });
+    }
+    writeLocalJSON(LOCAL_REACTS_PATH, list);
     console.log(`Added react-config for ${jid} -> ${emojis.join(',')}`);
-  } catch (e) { console.error('addNewsletterReactConfig', e); throw e; }
+  } catch (e) { console.error('addNewsletterReactConfigLocal', e); throw e; }
 }
 
-async function removeNewsletterReactConfig(jid) {
+async function removeNewsletterReactConfigLocal(jid) {
   try {
-    await initMongo();
-    await newsletterReactsCol.deleteOne({ jid });
+    let list = readLocalJSON(LOCAL_REACTS_PATH, []);
+    list = list.filter(d => d.jid !== jid);
+    writeLocalJSON(LOCAL_REACTS_PATH, list);
     console.log(`Removed react-config for ${jid}`);
-  } catch (e) { console.error('removeNewsletterReactConfig', e); throw e; }
+  } catch (e) { console.error('removeNewsletterReactConfigLocal', e); throw e; }
 }
 
-async function listNewsletterReactsFromMongo() {
+async function listNewsletterReactsFromLocal() {
   try {
-    await initMongo();
-    const docs = await newsletterReactsCol.find({}).toArray();
-    return docs.map(d => ({ jid: d.jid, emojis: Array.isArray(d.emojis) ? d.emojis : [] }));
-  } catch (e) { console.error('listNewsletterReactsFromMongo', e); return []; }
+    return readLocalJSON(LOCAL_REACTS_PATH, []);
+  } catch (e) { console.error('listNewsletterReactsFromLocal', e); return []; }
 }
 
-async function getReactConfigForJid(jid) {
+async function getReactConfigForJidLocal(jid) {
   try {
-    await initMongo();
-    const doc = await newsletterReactsCol.findOne({ jid });
+    const list = readLocalJSON(LOCAL_REACTS_PATH, []);
+    const doc = list.find(d => d.jid === jid);
     return doc ? (Array.isArray(doc.emojis) ? doc.emojis : []) : null;
-  } catch (e) { console.error('getReactConfigForJid', e); return null; }
+  } catch (e) { console.error('getReactConfigForJidLocal', e); return null; }
 }
+
+// ---- REACTIONS LOG ----
+async function saveNewsletterReactionLocal(jid, messageId, emoji, sessionNumber) {
+  try {
+    let log = readLocalJSON(LOCAL_REACTIONS_LOG_PATH, []);
+    log.push({ jid, messageId, emoji, sessionNumber, ts: new Date().toISOString() });
+    // Keep only last 1000 entries to prevent file bloat
+    if (log.length > 1000) log = log.slice(-1000);
+    writeLocalJSON(LOCAL_REACTIONS_LOG_PATH, log);
+    console.log(`Saved reaction ${emoji} for ${jid}#${messageId}`);
+  } catch (e) { console.error('saveNewsletterReactionLocal', e); }
+}
+
+// ===== WRAPPER FUNCTIONS (switch to local) =====
+// These replace the old MongoDB functions
+const addNewsletterToMongo = addNewsletterToLocal;
+const removeNewsletterFromMongo = removeNewsletterFromLocal;
+const listNewslettersFromMongo = listNewslettersFromLocal;
+const loadAdminsFromMongo = loadAdminsFromLocal;
+const addAdminToMongo = addAdminToLocal;
+const removeAdminFromMongo = removeAdminFromLocal;
+const addNewsletterReactConfig = addNewsletterReactConfigLocal;
+const removeNewsletterReactConfig = removeNewsletterReactConfigLocal;
+const listNewsletterReactsFromMongo = listNewsletterReactsFromLocal;
+const getReactConfigForJid = getReactConfigForJidLocal;
+const saveNewsletterReaction = saveNewsletterReactionLocal;
+
+// Also keep these for numbers (but we'll track them in memory + JSON)
+async function addNumberToLocal(number) {
+  try {
+    const sanitized = number.replace(/[^0-9]/g, '');
+    const numsPath = path.join(DATA_DIR, 'numbers.json');
+    let list = readLocalJSON(numsPath, []);
+    if (!list.includes(sanitized)) {
+      list.push(sanitized);
+      writeLocalJSON(numsPath, list);
+    }
+    console.log(`Added number ${sanitized} to local numbers`);
+  } catch (e) { console.error('addNumberToLocal', e); }
+}
+
+async function removeNumberFromLocal(number) {
+  try {
+    const sanitized = number.replace(/[^0-9]/g, '');
+    const numsPath = path.join(DATA_DIR, 'numbers.json');
+    let list = readLocalJSON(numsPath, []);
+    list = list.filter(n => n !== sanitized);
+    writeLocalJSON(numsPath, list);
+    console.log(`Removed number ${sanitized} from local numbers`);
+  } catch (e) { console.error('removeNumberFromLocal', e); }
+}
+
+async function getAllNumbersFromLocal() {
+  try {
+    const numsPath = path.join(DATA_DIR, 'numbers.json');
+    return readLocalJSON(numsPath, []);
+  } catch (e) { console.error('getAllNumbersFromLocal', e); return []; }
+}
+
+// Override old functions
+const addNumberToMongo = addNumberToLocal;
+const removeNumberFromMongo = removeNumberFromLocal;
+const getAllNumbersFromMongo = getAllNumbersFromLocal;
 
 function formatMessage(title, content, footer) {
   return `${title}\n\n${content}\n\n${footer}`;
@@ -989,7 +1056,7 @@ process.on('exit', () => {
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
-  try { exec(`pm2 restart ${process.env.PM2_NAME || 'SHALA-MD-MINI'}`); } catch(e) { console.error('Failed to restart pm2:', e); }
+  try { exec(`pm2 restart ${process.env.PM2_NAME || 'ZEUS-X-MINI'}`); } catch(e) { console.error('Failed to restart pm2:', e); }
 });
 
 initMongo().catch(err => console.warn('Mongo init failed at startup', err));
