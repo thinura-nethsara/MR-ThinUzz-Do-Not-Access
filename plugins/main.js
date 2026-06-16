@@ -8,7 +8,11 @@ const { cmd, commands } = require('../lib/command')
 const { downloadContentFromMessage } = require('baileyz');
 const { getBuffer, getGroupAdmins, getRandom, h2k, isUrl, Json, runtime, sleep, fetchJson, jsonformat} = require('../lib/functions')
 
-
+const amsg = "Check if bot is alive and responding";
+const aamsg = "Check active WhatsApp sessions"; 
+const pmsg = "Check bot's response speed";
+const mmsg = "Display all available commands";
+const ssmsg = "Display system information";
 
 //--------------- BOT' S ALIVE ------------------//
 cmd({
