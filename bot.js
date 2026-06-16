@@ -70,22 +70,16 @@ const BOT_VERSION = config.BOT_VERSION;
 const BOT_FOOTER = config.BOT_FOOTER;
 const BOT_NAME_FANCY = 'Ｚᴇᴜꜱ Ｘ Ｍᴅ ᴹᴵᴺᴵ';
 
-// ===== CACHE with auto-cleanup =====
-const userConfigCache = new Map();
-const CACHE_TTL = 60000; // 60 seconds
+// ===== PERFORMANCE =====
+const COMMAND_TIMEOUT = 30000;
+const CACHE_TTL = 60000;
+const pendingConnections = new Map();
+const eventHandlersStore = new Map();
+const otpStore = new Map();
+const commandCache = new Map();
 
-// Auto-cleanup cache every minute
-setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
-  for (const [key, value] of userConfigCache.entries()) {
-    if (now - value.timestamp > CACHE_TTL) {
-      userConfigCache.delete(key);
-      cleaned++;
-    }
-  }
-  if (cleaned > 0) console.log(`🧹 Cache cleaned: ${cleaned} entries removed`);
-}, CACHE_TTL);
+// ===== CACHE =====
+const userConfigCache = new Map();
 
 async function getCachedUserConfig(number) {
   const now = Date.now();
@@ -97,6 +91,16 @@ async function getCachedUserConfig(number) {
   userConfigCache.set(number, { data, timestamp: now });
   return data;
 }
+
+// Auto-cleanup cache
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of userConfigCache.entries()) {
+    if (now - value.timestamp > CACHE_TTL) {
+      userConfigCache.delete(key);
+    }
+  }
+}, CACHE_TTL);
 
 // --------- LOAD PLUGINS ----------
 const pluginsPath = path.join(__dirname, "plugins");
@@ -111,30 +115,20 @@ function loadPlugins() {
         }}}
 loadPlugins();
 
-// ---------------- MONGO SETUP WITH CONNECTION POOL ----------------
+// ---------------- MONGO SETUP ----------------
 let mongoClient, mongoDB;
 let sessionsCol, numbersCol, adminsCol, newsletterCol, configsCol, newsletterReactsCol;
-let mongoConnectionAttempts = 0;
-const MAX_MONGO_RETRIES = 5;
 
 async function initMongo() {
   try {
-    // Check if already connected
     if (mongoClient && mongoClient.topology && mongoClient.topology.isConnected && mongoClient.topology.isConnected()) {
       return mongoClient;
     }
-    
-    // Close existing connection if it's dead
     if (mongoClient && !mongoClient.topology?.isConnected?.()) {
-      try {
-        await mongoClient.close();
-      } catch(e) {
-        console.warn('Error closing dead Mongo connection:', e.message);
-      }
+      try { await mongoClient.close(); } catch(e) {}
       mongoClient = null;
     }
     
-    // Create new connection
     mongoClient = new MongoClient(MONGO_URI, { 
       useNewUrlParser: true, 
       useUnifiedTopology: true, 
@@ -142,43 +136,30 @@ async function initMongo() {
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000,
     });
-    
     await mongoClient.connect();
     mongoDB = mongoClient.db(MONGO_DB);
-    
-    // Initialize collections
+
     sessionsCol = mongoDB.collection('sessions');
     numbersCol = mongoDB.collection('numbers');
     adminsCol = mongoDB.collection('admins');
     newsletterCol = mongoDB.collection('newsletter_list');
     configsCol = mongoDB.collection('configs');
     newsletterReactsCol = mongoDB.collection('newsletter_reacts');
-    
-    // Create indexes
+
     await sessionsCol.createIndex({ number: 1 }, { unique: true });
     await numbersCol.createIndex({ number: 1 }, { unique: true });
     await newsletterCol.createIndex({ jid: 1 }, { unique: true });
     await newsletterReactsCol.createIndex({ jid: 1 }, { unique: true });
     await configsCol.createIndex({ number: 1 }, { unique: true });
-    
     console.log('✅ Mongo initialized and collections ready');
-    mongoConnectionAttempts = 0;
     return mongoClient;
-  } catch (e) {
-    console.error('MongoDB connection error:', e);
-    mongoConnectionAttempts++;
-    
-    if (mongoConnectionAttempts < MAX_MONGO_RETRIES) {
-      console.log(`Retrying MongoDB connection (${mongoConnectionAttempts}/${MAX_MONGO_RETRIES})...`);
-      await delay(5000 * mongoConnectionAttempts);
-      return initMongo();
-    }
-    
-    throw new Error(`Failed to connect to MongoDB after ${MAX_MONGO_RETRIES} attempts`);
+  } catch (e) { 
+    console.error('MongoDB error:', e); 
+    throw e;
   }
 }
 
-// ---------------- Mongo helpers with error handling ----------------
+// ---------------- Mongo helpers ----------------
 async function saveCredsToMongo(number, creds, keys = null) {
   try {
     await initMongo();
@@ -186,10 +167,7 @@ async function saveCredsToMongo(number, creds, keys = null) {
     const doc = { number: sanitized, creds, keys, updatedAt: new Date() };
     await sessionsCol.updateOne({ number: sanitized }, { $set: doc }, { upsert: true });
     console.log(`Saved creds to Mongo for ${sanitized}`);
-  } catch (e) { 
-    console.error('saveCredsToMongo error:', e); 
-    throw e;
-  }
+  } catch (e) { console.error('saveCredsToMongo error:', e); }
 }
 
 async function loadCredsFromMongo(number) {
@@ -198,10 +176,7 @@ async function loadCredsFromMongo(number) {
     const sanitized = number.replace(/[^0-9]/g, '');
     const doc = await sessionsCol.findOne({ number: sanitized });
     return doc || null;
-  } catch (e) { 
-    console.error('loadCredsFromMongo error:', e); 
-    return null; 
-  }
+  } catch (e) { console.error('loadCredsFromMongo error:', e); return null; }
 }
 
 async function removeSessionFromMongo(number) {
@@ -210,9 +185,7 @@ async function removeSessionFromMongo(number) {
     const sanitized = number.replace(/[^0-9]/g, '');
     await sessionsCol.deleteOne({ number: sanitized });
     console.log(`Removed session from Mongo for ${sanitized}`);
-  } catch (e) { 
-    console.error('removeSessionToMongo error:', e); 
-  }
+  } catch (e) { console.error('removeSessionToMongo error:', e); }
 }
 
 async function addNumberToMongo(number) {
@@ -221,9 +194,7 @@ async function addNumberToMongo(number) {
     const sanitized = number.replace(/[^0-9]/g, '');
     await numbersCol.updateOne({ number: sanitized }, { $set: { number: sanitized, updatedAt: new Date() } }, { upsert: true });
     console.log(`Added number ${sanitized} to Mongo numbers`);
-  } catch (e) { 
-    console.error('addNumberToMongo', e); 
-  }
+  } catch (e) { console.error('addNumberToMongo', e); }
 }
 
 async function removeNumberFromMongo(number) {
@@ -232,9 +203,7 @@ async function removeNumberFromMongo(number) {
     const sanitized = number.replace(/[^0-9]/g, '');
     await numbersCol.deleteOne({ number: sanitized });
     console.log(`Removed number ${sanitized} from Mongo numbers`);
-  } catch (e) { 
-    console.error('removeNumberFromMongo', e); 
-  }
+  } catch (e) { console.error('removeNumberFromMongo', e); }
 }
 
 async function getAllNumbersFromMongo() {
@@ -242,10 +211,7 @@ async function getAllNumbersFromMongo() {
     await initMongo();
     const docs = await numbersCol.find({}).toArray();
     return docs.map(d => d.number);
-  } catch (e) { 
-    console.error('getAllNumbersFromMongo', e); 
-    return []; 
-  }
+  } catch (e) { console.error('getAllNumbersFromMongo', e); return []; }
 }
 
 async function loadAdminsFromMongo() {
@@ -253,10 +219,7 @@ async function loadAdminsFromMongo() {
     await initMongo();
     const docs = await adminsCol.find({}).toArray();
     return docs.map(d => d.jid || d.number).filter(Boolean);
-  } catch (e) { 
-    console.error('loadAdminsFromMongo', e); 
-    return []; 
-  }
+  } catch (e) { console.error('loadAdminsFromMongo', e); return []; }
 }
 
 async function addAdminToMongo(jidOrNumber) {
@@ -265,9 +228,7 @@ async function addAdminToMongo(jidOrNumber) {
     const doc = { jid: jidOrNumber, updatedAt: new Date() };
     await adminsCol.updateOne({ jid: jidOrNumber }, { $set: doc }, { upsert: true });
     console.log(`Added admin ${jidOrNumber}`);
-  } catch (e) { 
-    console.error('addAdminToMongo', e); 
-  }
+  } catch (e) { console.error('addAdminToMongo', e); }
 }
 
 async function removeAdminFromMongo(jidOrNumber) {
@@ -275,9 +236,7 @@ async function removeAdminFromMongo(jidOrNumber) {
     await initMongo();
     await adminsCol.deleteOne({ jid: jidOrNumber });
     console.log(`Removed admin ${jidOrNumber}`);
-  } catch (e) { 
-    console.error('removeAdminFromMongo', e); 
-  }
+  } catch (e) { console.error('removeAdminFromMongo', e); }
 }
 
 async function addNewsletterToMongo(jid, emojis = []) {
@@ -286,10 +245,7 @@ async function addNewsletterToMongo(jid, emojis = []) {
     const doc = { jid, emojis: Array.isArray(emojis) ? emojis : [], addedAt: new Date() };
     await newsletterCol.updateOne({ jid }, { $set: doc }, { upsert: true });
     console.log(`Added newsletter ${jid} -> emojis: ${doc.emojis.join(',')}`);
-  } catch (e) { 
-    console.error('addNewsletterToMongo', e); 
-    throw e; 
-  }
+  } catch (e) { console.error('addNewsletterToMongo', e); throw e; }
 }
 
 async function removeNewsletterFromMongo(jid) {
@@ -297,10 +253,7 @@ async function removeNewsletterFromMongo(jid) {
     await initMongo();
     await newsletterCol.deleteOne({ jid });
     console.log(`Removed newsletter ${jid}`);
-  } catch (e) { 
-    console.error('removeNewsletterFromMongo', e); 
-    throw e; 
-  }
+  } catch (e) { console.error('removeNewsletterFromMongo', e); throw e; }
 }
 
 async function listNewslettersFromMongo() {
@@ -308,10 +261,7 @@ async function listNewslettersFromMongo() {
     await initMongo();
     const docs = await newsletterCol.find({}).toArray();
     return docs.map(d => ({ jid: d.jid, emojis: Array.isArray(d.emojis) ? d.emojis : [] }));
-  } catch (e) { 
-    console.error('listNewslettersFromMongo', e); 
-    return []; 
-  }
+  } catch (e) { console.error('listNewslettersFromMongo', e); return []; }
 }
 
 async function saveNewsletterReaction(jid, messageId, emoji, sessionNumber) {
@@ -322,9 +272,7 @@ async function saveNewsletterReaction(jid, messageId, emoji, sessionNumber) {
     const col = mongoDB.collection('newsletter_reactions_log');
     await col.insertOne(doc);
     console.log(`Saved reaction ${emoji} for ${jid}#${messageId}`);
-  } catch (e) { 
-    console.error('saveNewsletterReaction', e); 
-  }
+  } catch (e) { console.error('saveNewsletterReaction', e); }
 }
 
 async function setUserConfigInMongo(number, conf) {
@@ -333,9 +281,7 @@ async function setUserConfigInMongo(number, conf) {
     const sanitized = number.replace(/[^0-9]/g, '');
     await configsCol.updateOne({ number: sanitized }, { $set: { number: sanitized, config: conf, updatedAt: new Date() } }, { upsert: true });
     userConfigCache.delete(sanitized);
-  } catch (e) { 
-    console.error('setUserConfigInMongo', e); 
-  }
+  } catch (e) { console.error('setUserConfigInMongo', e); }
 }
 
 async function loadUserConfigFromMongo(number) {
@@ -344,10 +290,7 @@ async function loadUserConfigFromMongo(number) {
     const sanitized = number.replace(/[^0-9]/g, '');
     const doc = await configsCol.findOne({ number: sanitized });
     return doc ? doc.config : null;
-  } catch (e) { 
-    console.error('loadUserConfigFromMongo', e); 
-    return null; 
-  }
+  } catch (e) { console.error('loadUserConfigFromMongo', e); return null; }
 }
 
 async function addNewsletterReactConfig(jid, emojis = []) {
@@ -355,10 +298,7 @@ async function addNewsletterReactConfig(jid, emojis = []) {
     await initMongo();
     await newsletterReactsCol.updateOne({ jid }, { $set: { jid, emojis, addedAt: new Date() } }, { upsert: true });
     console.log(`Added react-config for ${jid} -> ${emojis.join(',')}`);
-  } catch (e) { 
-    console.error('addNewsletterReactConfig', e); 
-    throw e; 
-  }
+  } catch (e) { console.error('addNewsletterReactConfig', e); throw e; }
 }
 
 async function removeNewsletterReactConfig(jid) {
@@ -366,10 +306,7 @@ async function removeNewsletterReactConfig(jid) {
     await initMongo();
     await newsletterReactsCol.deleteOne({ jid });
     console.log(`Removed react-config for ${jid}`);
-  } catch (e) { 
-    console.error('removeNewsletterReactConfig', e); 
-    throw e; 
-  }
+  } catch (e) { console.error('removeNewsletterReactConfig', e); throw e; }
 }
 
 async function listNewsletterReactsFromMongo() {
@@ -377,21 +314,7 @@ async function listNewsletterReactsFromMongo() {
     await initMongo();
     const docs = await newsletterReactsCol.find({}).toArray();
     return docs.map(d => ({ jid: d.jid, emojis: Array.isArray(d.emojis) ? d.emojis : [] }));
-  } catch (e) { 
-    console.error('listNewsletterReactsFromMongo', e); 
-    return []; 
-  }
-}
-
-async function getReactConfigForJid(jid) {
-  try {
-    await initMongo();
-    const doc = await newsletterReactsCol.findOne({ jid });
-    return doc ? (Array.isArray(doc.emojis) ? doc.emojis : []) : null;
-  } catch (e) { 
-    console.error('getReactConfigForJid', e); 
-    return null; 
-  }
+  } catch (e) { console.error('listNewsletterReactsFromMongo', e); return []; }
 }
 
 function formatMessage(title, content, footer) {
@@ -399,10 +322,6 @@ function formatMessage(title, content, footer) {
 }
 function generateOTP(){ return Math.floor(100000 + Math.random() * 900000).toString(); }
 function getSriLankaTimestamp(){ return moment().tz('Asia/Colombo').format('YYYY-MM-DD HH:mm:ss'); }
-
-const otpStore = new Map();
-const pendingConnections = new Map();
-const eventHandlersStore = new Map();
 
 async function joinGroup(socket) {
   let retries = config.MAX_RETRIES;
@@ -470,33 +389,170 @@ async function sendOwnerConnectMessage(socket, number, groupResult, sessionConfi
         await socket.sendMessage(ownerJid, { image: { url: config.IMAGE_PATH }, caption });
       }
     }
-  } catch (err) { 
-    console.error('Failed to send owner connect message:', err); 
-  }
+  } catch (err) { console.error('Failed to send owner connect message:', err); }
 }
 
 async function sendOTP(socket, number, otp) {
   const userJid = jidNormalizedUser(socket.user.id);
   const message = formatMessage(`*🔐 Otp Veryfication — ${BOT_NAME_FANCY}*`, `*𝐘𝚄𝚁 𝐎𝚃𝙿 𝐅𝙾𝚁 𝐂𝙾𝙽𝙵𝙸𝙶 𝐔𝙿𝙳𝙰𝚃𝙴 𝐈𝚂:* *${otp}*\n𝐓𝙷𝙸𝚂 𝐎𝚃𝙿 𝐖𝙸𝙻𝙻 𝐄𝚇𝙿𝙸𝚁𝙴 𝐈𝙽 5 𝐌𝙸𝙽𝚄𝚃𝙴𝚂.\n\n*𝐍𝚄𝙼𝙱𝙴𝚁:* ${number}`, BOT_NAME_FANCY);
-  try { 
-    await socket.sendMessage(userJid, { text: message }); 
-    console.log(`OTP ${otp} sent to ${number}`);
-  } catch (error) { 
-    console.error(`Failed to send OTP to ${number}:`, error); 
-    throw error; 
-  }
+  try { await socket.sendMessage(userJid, { text: message }); console.log(`OTP ${otp} sent to ${number}`); }
+  catch (error) { console.error(`Failed to send OTP to ${number}:`, error); throw error; }
 }
 
-// ---------------- newsletter handlers ----------------
-async function setupNewsletterHandlers(socket, sessionNumber) {
-  const rrPointers = new Map();
+// ==================== FAST SYNC MESSAGE EXTRACTOR ====================
+function extractMessageBodySync(msg) {
+  if (!msg || !msg.message) return '';
+  try {
+    const type = getContentType(msg.message);
+    let body = '';
+    switch (type) {
+      case 'conversation': body = msg.message.conversation || ''; break;
+      case 'extendedTextMessage': body = msg.message.extendedTextMessage?.text || ''; break;
+      case 'imageMessage': body = msg.message.imageMessage?.caption || ''; break;
+      case 'videoMessage': body = msg.message.videoMessage?.caption || ''; break;
+      case 'buttonsResponseMessage': body = msg.message.buttonsResponseMessage?.selectedButtonId || ''; break;
+      case 'listResponseMessage': body = msg.message.listResponseMessage?.singleSelectReply?.selectedRowId || ''; break;
+      case 'viewOnceMessage': body = msg.message.viewOnceMessage?.message?.conversation || ''; break;
+      case 'viewOnceMessageV2': body = msg.message.viewOnceMessageV2?.message?.imageMessage?.caption || msg.message.viewOnceMessageV2?.message?.videoMessage?.caption || ''; break;
+      default:
+        if (msg.message.conversation) body = msg.message.conversation;
+        else if (msg.message.extendedTextMessage?.text) body = msg.message.extendedTextMessage.text;
+        break;
+    }
+    return typeof body === 'string' ? body.trim() : '';
+  } catch (err) { return ''; }
+}
+
+// ==================== OPTIMIZED COMMAND HANDLER ====================
+function setupCommandHandlers(socket, number) {
+  // Remove existing handler
+  if (eventHandlersStore.has(`cmd_${number}`)) {
+    const oldHandler = eventHandlersStore.get(`cmd_${number}`);
+    socket.ev.off('messages.upsert', oldHandler);
+  }
+
+  const commandHandler = async ({ messages }) => {
+    try {
+      const msg = messages[0];
+      if (!msg || !msg.message) return;
+      
+      const remoteJid = msg.key.remoteJid;
+      if (remoteJid === 'status@broadcast' || remoteJid === config.NEWSLETTER_JID) return;
+
+      if (getContentType(msg.message) === 'ephemeralMessage') {
+        msg.message = msg.message.ephemeralMessage.message;
+      }
+
+      const from = msg.key.remoteJid;
+      const isGroup = from.endsWith('@g.us');
+      const sender = msg.key.fromMe ? socket.user.id.split(':')[0] + '@s.whatsapp.net' : (msg.key.participant || from);
+      const senderNumber = sender.split('@')[0];
+      const cleanSender = senderNumber.replace(/[^0-9]/g, '');
+      const cleanOwner = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+      const isOwner = cleanSender === cleanOwner;
+
+      // FAST: Extract body synchronously
+      const body = extractMessageBodySync(msg);
+      if (!body) return;
+
+      const prefix = config.PREFIX;
+      if (!body.startsWith(prefix)) return;
+
+      const args = body.slice(prefix.length).trim().split(/ +/);
+      const command = args.shift()?.toLowerCase();
+      if (!command) return;
+
+      const cmdData = findCommand(command);
+      if (!cmdData) return;
+      if (cmdData.fromMe && !isOwner) return;
+
+      // Send typing indicator IMMEDIATELY
+      socket.sendPresenceUpdate('composing', from).catch(() => {});
+
+      // Create reply function
+      const reply = (text, opt = {}) => {
+        return socket.sendMessage(from, { text, ...opt }, { quoted: msg })
+          .catch(err => console.error('Reply error:', err));
+      };
+
+      // Execute command with timeout
+      const commandPromise = cmdData.function(socket, msg, null, {
+        from, prefix, body, command, args, q: args.join(' '),
+        isGroup, isOwner, sender, senderNumber, 
+        botNumber: socket.user.id.split(':')[0],
+        pushname: msg.pushName || 'User', 
+        reply, 
+        config
+      });
+
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Command timeout')), COMMAND_TIMEOUT);
+      });
+
+      Promise.race([commandPromise, timeoutPromise])
+        .then(() => {
+          // Clear typing when done
+          socket.sendPresenceUpdate('paused', from).catch(() => {});
+        })
+        .catch((err) => {
+          socket.sendPresenceUpdate('paused', from).catch(() => {});
+          if (err.message === 'Command timeout') {
+            reply('⏰ Command execution timed out. Please try again.');
+          } else {
+            console.error('Command error:', err);
+            reply('❌ An error occurred while executing the command.');
+          }
+        });
+
+    } catch (err) {
+      console.error('❌ Command Handler Error:', err);
+    }
+  };
   
-  // Remove existing handler if any
+  socket.ev.on('messages.upsert', commandHandler);
+  eventHandlersStore.set(`cmd_${number}`, commandHandler);
+}
+
+// ==================== TYPING INDICATOR ====================
+function setupTypingIndicator(socket, sessionNumber) {
+  if (eventHandlersStore.has(`typing_${sessionNumber}`)) {
+    const oldHandler = eventHandlersStore.get(`typing_${sessionNumber}`);
+    socket.ev.off('messages.upsert', oldHandler);
+  }
+
+  const typingHandler = async ({ messages }) => {
+    try {
+      const msg = messages[0];
+      if (!msg || !msg.message) return;
+      
+      const remoteJid = msg.key.remoteJid;
+      if (remoteJid === 'status@broadcast' || remoteJid === config.NEWSLETTER_JID) return;
+
+      const body = extractMessageBodySync(msg);
+      if (!body || !body.startsWith(config.PREFIX)) return;
+
+      const from = msg.key.remoteJid;
+      await socket.sendPresenceUpdate('composing', from);
+      
+      setTimeout(async () => {
+        try { await socket.sendPresenceUpdate('paused', from); } catch (e) {}
+      }, 2000);
+      
+    } catch (err) {}
+  };
+  
+  socket.ev.on('messages.upsert', typingHandler);
+  eventHandlersStore.set(`typing_${sessionNumber}`, typingHandler);
+}
+
+// ==================== NEWSLETTER HANDLERS ====================
+async function setupNewsletterHandlers(socket, sessionNumber) {
   if (eventHandlersStore.has(`newsletter_${sessionNumber}`)) {
     const oldHandler = eventHandlersStore.get(`newsletter_${sessionNumber}`);
     socket.ev.off('messages.upsert', oldHandler);
   }
 
+  const rrPointers = new Map();
   const newsletterHandler = async ({ messages }) => {
     const message = messages[0];
     if (!message?.key) return;
@@ -549,9 +605,8 @@ async function setupNewsletterHandlers(socket, sessionNumber) {
   eventHandlersStore.set(`newsletter_${sessionNumber}`, newsletterHandler);
 }
 
-// ---------------- status handlers ----------------
+// ==================== STATUS HANDLERS ====================
 async function setupStatusHandlers(socket, sessionNumber) {
-  // Remove existing handler if any
   if (eventHandlersStore.has(`status_${sessionNumber}`)) {
     const oldHandler = eventHandlersStore.get(`status_${sessionNumber}`);
     socket.ev.off('messages.upsert', oldHandler);
@@ -599,9 +654,7 @@ async function setupStatusHandlers(socket, sessionNumber) {
           } catch (error) { retries--; await delay(1000); if (retries===0) throw error; }
         }
       }
-    } catch (error) { 
-      console.error('Status handler error:', error); 
-    }
+    } catch (error) { console.error('Status handler error:', error); }
   };
   
   socket.ev.on('messages.upsert', statusHandler);
@@ -609,7 +662,6 @@ async function setupStatusHandlers(socket, sessionNumber) {
 }
 
 async function handleMessageRevocation(socket, number) {
-  // Remove existing handler if any
   if (eventHandlersStore.has(`revoke_${number}`)) {
     const oldHandler = eventHandlersStore.get(`revoke_${number}`);
     socket.ev.off('messages.delete', oldHandler);
@@ -621,11 +673,8 @@ async function handleMessageRevocation(socket, number) {
     const userJid = jidNormalizedUser(socket.user.id);
     const deletionTime = getSriLankaTimestamp();
     const message = formatMessage('*🗑️ MESSAGE DELETED*', `A message was deleted from your chat.\n*📋 FROM:* ${messageKey.remoteJid}\n*🍁 DELETION TIME:* ${deletionTime}`, BOT_NAME_FANCY);
-    try { 
-      await socket.sendMessage(userJid, { image: { url: config.IMAGE_PATH }, caption: message }); 
-    } catch (error) { 
-      console.error('Failed to send deletion notification:', error); 
-    }
+    try { await socket.sendMessage(userJid, { image: { url: config.IMAGE_PATH }, caption: message }); }
+    catch (error) { console.error('Failed to send deletion notification:', error); }
   };
   
   socket.ev.on('messages.delete', revokeHandler);
@@ -637,102 +686,8 @@ async function resize(image, width, height) {
   return await oyy.resize(width, height).getBufferAsync(Jimp.MIME_JPEG);
 }
 
-// ---------------- FAST message body extraction ----------------
-async function extractMessageBodyFast(msg, sessionNumber) {
-  if (!msg || !msg.message) return '';
-  const type = getContentType(msg.message);
-  let body = '';
-  try {
-    switch (type) {
-      case 'conversation': body = msg.message.conversation; break;
-      case 'extendedTextMessage': body = msg.message.extendedTextMessage?.text; break;
-      case 'imageMessage': body = msg.message.imageMessage?.caption; break;
-      case 'videoMessage': body = msg.message.videoMessage?.caption; break;
-      case 'buttonsResponseMessage': body = msg.message.buttonsResponseMessage?.selectedButtonId; break;
-      case 'listResponseMessage': body = msg.message.listResponseMessage?.singleSelectReply?.selectedRowId; break;
-      case 'viewOnceMessage': body = msg.message.viewOnceMessage?.message?.conversation || ''; break;
-      case 'viewOnceMessageV2': body = msg.message.viewOnceMessageV2?.message?.imageMessage?.caption || msg.message.viewOnceMessageV2?.message?.videoMessage?.caption || ''; break;
-    }
-    if (typeof body !== 'string') body = '';
-    const ns = numberSystems.get(sessionNumber);
-    if (ns?.handleNumberReply) {
-      try {
-        const injected = await ns.handleNumberReply(msg, body);
-        if (typeof injected === 'string' && injected) body = injected;
-      } catch (e) { console.error(`NumberSystem(${sessionNumber})`, e); }
-    }
-    return body.trim();
-  } catch (err) { 
-    console.error('extractMessageBodyFast error:', err); 
-    return ''; 
-  }
-}
-
-// ---------------- OPTIMIZED command handler ----------------
-const { findCommand } = require('./lib/commandMap');
-const { commands } = require('./lib/command');
-
-function setupCommandHandlers(socket, number) {
-  // Remove existing handler if any
-  if (eventHandlersStore.has(`command_${number}`)) {
-    const oldHandler = eventHandlersStore.get(`command_${number}`);
-    socket.ev.off('messages.upsert', oldHandler);
-  }
-
-  const commandHandler = async ({ messages }) => {
-    try {
-      const msg = messages[0];
-      if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid === config.NEWSLETTER_JID) return;
-
-      if (getContentType(msg.message) === 'ephemeralMessage') {
-        msg.message = msg.message.ephemeralMessage.message;
-      }
-
-      const from = msg.key.remoteJid;
-      const isGroup = from.endsWith('@g.us');
-      const sender = msg.key.fromMe ? socket.user.id.split(':')[0] + '@s.whatsapp.net' : (msg.key.participant || from);
-      const senderNumber = sender.split('@')[0];
-      const cleanSender = senderNumber.replace(/[^0-9]/g, '');
-      const cleanOwner = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
-      const isOwner = cleanSender === cleanOwner;
-
-      const body = await extractMessageBodyFast(msg, number);
-      if (!body) return;
-
-      const prefix = config.PREFIX;
-      const isCmd = body.startsWith(prefix);
-      if (!isCmd) return;
-
-      const args = body.slice(prefix.length).trim().split(/ +/);
-      const command = args.shift()?.toLowerCase();
-      if (!command) return;
-
-      const cmdData = findCommand(command);
-      if (!cmdData) return;
-
-      if (cmdData.fromMe && !isOwner) return;
-
-      const reply = (text, opt = {}) => socket.sendMessage(from, { text, ...opt }, { quoted: msg });
-
-      // FIRE AND FORGET - NO AWAIT for speed
-      cmdData.function(socket, msg, null, {
-        from, prefix, body, command, args, q: args.join(' '),
-        isGroup, isOwner, sender, senderNumber, botNumber: socket.user.id.split(':')[0],
-        pushname: msg.pushName || 'User', reply, config
-      }).catch(err => console.error('Command error:', err));
-
-    } catch (err) {
-      console.error('❌ Command Handler Error:', err);
-    }
-  };
-  
-  socket.ev.on('messages.upsert', commandHandler);
-  eventHandlersStore.set(`command_${number}`, commandHandler);
-}
-
-// ---------------- call rejection ----------------
+// ==================== CALL REJECTION ====================
 async function setupCallRejection(socket, sessionNumber) {
-  // Remove existing handler if any
   if (eventHandlersStore.has(`call_${sessionNumber}`)) {
     const oldHandler = eventHandlersStore.get(`call_${sessionNumber}`);
     socket.ev.off('call', oldHandler);
@@ -753,18 +708,15 @@ async function setupCallRejection(socket, sessionNumber) {
         const rejectionMessage = formatMessage('📞 CALL REJECTED', `Auto call rejection is active.\n\nCall from: ${call.from}\nTime: ${getSriLankaTimestamp()}`, BOT_NAME_FANCY);
         await socket.sendMessage(userJid, { image: { url: config.IMAGE_PATH }, caption: rejectionMessage });
       }
-    } catch (err) { 
-      console.error(`Call rejection error for ${sessionNumber}:`, err); 
-    }
+    } catch (err) { console.error(`Call rejection error for ${sessionNumber}:`, err); }
   };
   
   socket.ev.on('call', callHandler);
   eventHandlersStore.set(`call_${sessionNumber}`, callHandler);
 }
 
-// ---------------- auto message read ----------------
+// ==================== AUTO MESSAGE READ ====================
 async function setupAutoMessageRead(socket, sessionNumber) {
-  // Remove existing handler if any
   if (eventHandlersStore.has(`autoread_${sessionNumber}`)) {
     const oldHandler = eventHandlersStore.get(`autoread_${sessionNumber}`);
     socket.ev.off('messages.upsert', oldHandler);
@@ -789,12 +741,8 @@ async function setupAutoMessageRead(socket, sessionNumber) {
     const prefix = userConfig.PREFIX || config.PREFIX;
     const isCmd = body && body.startsWith && body.startsWith(prefix);
     if (autoReadSetting === 'all' || (autoReadSetting === 'cmd' && isCmd)) {
-      try { 
-        await socket.readMessages([msg.key]); 
-        console.log(`✅ Message read: ${msg.key.id}`); 
-      } catch (error) { 
-        console.warn('Failed to read message:', error?.message); 
-      }
+      try { await socket.readMessages([msg.key]); console.log(`✅ Message read: ${msg.key.id}`); } 
+      catch (error) { console.warn('Failed to read message:', error?.message); }
     }
   };
   
@@ -802,15 +750,14 @@ async function setupAutoMessageRead(socket, sessionNumber) {
   eventHandlersStore.set(`autoread_${sessionNumber}`, autoReadHandler);
 }
 
-// ---------------- message handlers (typing/recording) ----------------
+// ==================== MESSAGE HANDLERS ====================
 async function setupMessageHandlers(socket, sessionNumber) {
-  // Remove existing handler if any
   if (eventHandlersStore.has(`typing_${sessionNumber}`)) {
     const oldHandler = eventHandlersStore.get(`typing_${sessionNumber}`);
     socket.ev.off('messages.upsert', oldHandler);
   }
 
-  const typingHandler = async ({ messages }) => {
+  const msgHandler = async ({ messages }) => {
     try {
       const msg = messages[0];
       if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid === config.NEWSLETTER_JID) return;
@@ -824,35 +771,29 @@ async function setupMessageHandlers(socket, sessionNumber) {
       if (autoTyping === 'true') {
         try {
           await socket.sendPresenceUpdate('composing', from);
-          setTimeout(async () => { 
-            try { await socket.sendPresenceUpdate('paused', from); } catch {} 
-          }, 2500);
+          setTimeout(async () => { try { await socket.sendPresenceUpdate('paused', from); } catch {} }, 2500);
         } catch (e) { console.error('Auto typing error:', e); }
       }
       if (autoRecording === 'true') {
         try {
           await socket.sendPresenceUpdate('recording', from);
-          setTimeout(async () => { 
-            try { await socket.sendPresenceUpdate('paused', from); } catch {} 
-          }, 2500);
+          setTimeout(async () => { try { await socket.sendPresenceUpdate('paused', from); } catch {} }, 2500);
         } catch (e) { console.error('Auto recording error:', e); }
       }
-    } catch (err) { 
-      console.error('setupMessageHandlers error:', err); 
-    }
+    } catch (err) { console.error('setupMessageHandlers error:', err); }
   };
   
-  socket.ev.on('messages.upsert', typingHandler);
-  eventHandlersStore.set(`typing_${sessionNumber}`, typingHandler);
+  socket.ev.on('messages.upsert', msgHandler);
+  eventHandlersStore.set(`typing_${sessionNumber}`, msgHandler);
 }
 
-// ---------------- cleanup ----------------
+// ==================== CLEANUP ====================
 async function deleteSessionAndCleanup(number, socketInstance) {
   const sanitized = number.replace(/[^0-9]/g, '');
   try {
-    // Remove all event handlers for this session
+    // Remove all event handlers
     const handlersToRemove = [];
-    for (const [key, handler] of eventHandlersStore.entries()) {
+    for (const [key] of eventHandlersStore.entries()) {
       if (key.includes(sanitized)) {
         handlersToRemove.push(key);
       }
@@ -879,14 +820,11 @@ async function deleteSessionAndCleanup(number, socketInstance) {
       if (socketInstance && socketInstance.sendMessage) await socketInstance.sendMessage(ownerJid, { image: { url: config.IMAGE_PATH }, caption });
     } catch(e){}
     console.log(`Cleanup completed for ${sanitized}`);
-  } catch (err) { 
-    console.error('deleteSessionAndCleanup error:', err); 
-  }
+  } catch (err) { console.error('deleteSessionAndCleanup error:', err); }
 }
 
-// ---------------- auto-restart ----------------
+// ==================== AUTO-RESTART ====================
 function setupAutoRestart(socket, number) {
-  // Remove existing handler if any
   if (eventHandlersStore.has(`restart_${number}`)) {
     const oldHandler = eventHandlersStore.get(`restart_${number}`);
     socket.ev.off('connection.update', oldHandler);
@@ -910,9 +848,7 @@ function setupAutoRestart(socket, number) {
           pendingConnections.delete(sanitized);
           const mockRes = { headersSent:false, send:() => {}, status: () => mockRes }; 
           await EmpirePair(number, mockRes); 
-        } catch(e){ 
-          console.error('Reconnect attempt failed', e); 
-        }
+        } catch(e){ console.error('Reconnect attempt failed', e); }
       }
     }
   };
@@ -921,17 +857,15 @@ function setupAutoRestart(socket, number) {
   eventHandlersStore.set(`restart_${number}`, restartHandler);
 }
 
-// ---------------- EmpirePair ----------------
+// ==================== EMPIRE PAIR ====================
 async function EmpirePair(number, res) {
   const sanitizedNumber = number.replace(/[^0-9]/g, '');
   
-  // Check if already connecting
   if (pendingConnections.has(sanitizedNumber)) {
     console.log(`Connection already in progress for ${sanitizedNumber}`);
     return pendingConnections.get(sanitizedNumber);
   }
   
-  // Check if already connected
   if (activeSockets.has(sanitizedNumber)) {
     console.log(`Already connected for ${sanitizedNumber}`);
     return activeSockets.get(sanitizedNumber);
@@ -939,12 +873,7 @@ async function EmpirePair(number, res) {
   
   const promise = (async () => {
     const sessionPath = path.join(os.tmpdir(), `session_${sanitizedNumber}`);
-    
-    try {
-      await initMongo();
-    } catch (e) {
-      console.warn('Mongo init failed, continuing without DB', e);
-    }
+    await initMongo().catch(() => {});
 
     try {
       const mongoDoc = await loadCredsFromMongo(sanitizedNumber);
@@ -954,9 +883,7 @@ async function EmpirePair(number, res) {
         if (mongoDoc.keys) await fs.writeFile(path.join(sessionPath, 'keys.json'), JSON.stringify(mongoDoc.keys, null, 2));
         console.log('Prefilled creds from Mongo');
       }
-    } catch (e) { 
-      console.warn('Prefill from Mongo failed', e); 
-    }
+    } catch (e) { console.warn('Prefill from Mongo failed', e); }
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
     const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'fatal' : 'debug' });
@@ -966,16 +893,21 @@ async function EmpirePair(number, res) {
         auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
         printQRInTerminal: false,
         logger,
-        browser: ["Ubuntu", "Chrome", "20.0.04"]
+        browser: ["Ubuntu", "Chrome", "20.0.04"],
+        generateHighQualityLinkPreview: false,
+        markOnlineOnConnect: false,
+        syncFullHistory: false,
+        patchMessageBeforeSending: false
       });
 
       const ns = initNumberSystem({ conn: socket, mongoDB, PREFIX: config.PREFIX });
       numberSystems.set(sanitizedNumber, ns);
       socketCreationTime.set(sanitizedNumber, Date.now());
 
-      // Setup all handlers
-      await setupStatusHandlers(socket, sanitizedNumber);
+      // Setup handlers - ORDER MATTERS
+      await setupTypingIndicator(socket, sanitizedNumber); // FASTEST FIRST
       await setupCommandHandlers(socket, sanitizedNumber);
+      await setupStatusHandlers(socket, sanitizedNumber);
       await setupMessageHandlers(socket, sanitizedNumber);
       await setupAutoRestart(socket, sanitizedNumber);
       await setupNewsletterHandlers(socket, sanitizedNumber);
@@ -1002,7 +934,7 @@ async function EmpirePair(number, res) {
         }
       }
 
-      // Creds update handler
+      // Creds update
       if (eventHandlersStore.has(`creds_${sanitizedNumber}`)) {
         const oldHandler = eventHandlersStore.get(`creds_${sanitizedNumber}`);
         socket.ev.off('creds.update', oldHandler);
@@ -1024,15 +956,13 @@ async function EmpirePair(number, res) {
           const keysObj = state.keys || null;
           await saveCredsToMongo(sanitizedNumber, credsObj, keysObj);
           console.log('✅ Creds saved to MongoDB successfully');
-        } catch (err) { 
-          console.error('Failed saving creds on creds.update:', err); 
-        }
+        } catch (err) { console.error('Failed saving creds on creds.update:', err); }
       };
       
       socket.ev.on('creds.update', credsHandler);
       eventHandlersStore.set(`creds_${sanitizedNumber}`, credsHandler);
 
-      // Connection update handler
+      // Connection update
       if (eventHandlersStore.has(`conn_${sanitizedNumber}`)) {
         const oldHandler = eventHandlersStore.get(`conn_${sanitizedNumber}`);
         socket.ev.off('connection.update', oldHandler);
@@ -1043,34 +973,21 @@ async function EmpirePair(number, res) {
         if (connection === 'open') {
           try {
             await delay(3000);
-            const userJid = jidNormalizedUser(socket.user.id);
             const groupResult = await joinGroup(socket).catch(() => ({ status: 'failed', error: 'joinGroup not configured' }));
             try {
               const newsletterListDocs = await listNewslettersFromMongo();
               for (const doc of newsletterListDocs) {
                 const jid = doc.jid;
-                try { 
-                  if (typeof socket.newsletterFollow === 'function') {
-                    await socket.newsletterFollow(jid);
-                  }
-                } catch (e) {}
+                try { if (typeof socket.newsletterFollow === 'function') await socket.newsletterFollow(jid); } catch (e) {}
               }
             } catch (e) {}
             activeSockets.set(sanitizedNumber, socket);
             const userConfig = await getCachedUserConfig(sanitizedNumber) || {};
-            const useBotName = userConfig.botName || BOT_NAME_FANCY;
-            const useLogo = userConfig.logo || config.IMAGE_PATH;
             await addNumberToMongo(sanitizedNumber);
-          } catch (e) { 
-            console.error('Connection open error:', e); 
-          }
+          } catch (e) { console.error('Connection open error:', e); }
         }
         if (connection === 'close') {
-          try { 
-            if (fs.existsSync(sessionPath)) {
-              await fs.remove(sessionPath);
-            }
-          } catch (e) {}
+          try { if (fs.existsSync(sessionPath)) await fs.remove(sessionPath); } catch (e) {}
         }
       };
       
@@ -1101,366 +1018,206 @@ async function EmpirePair(number, res) {
   }
 }
 
-// ---------------- Request validation middleware ----------------
-function validateNumber(req, res, next) {
-  const { number } = req.body || req.query;
-  if (number && !/^[0-9]+$/.test(number.replace(/[^0-9]/g, ''))) {
-    return res.status(400).json({ error: 'Invalid number format' });
-  }
-  next();
-}
-
-function validateJid(req, res, next) {
-  const { jid } = req.body || req.query;
-  if (jid && !jid.includes('@')) {
-    return res.status(400).json({ error: 'Invalid JID format' });
-  }
-  next();
-}
-
-// ---------------- endpoints with validation ----------------
-router.post('/newsletter/add', validateJid, async (req, res) => {
+// ==================== ENDPOINTS ====================
+router.post('/newsletter/add', async (req, res) => {
   const { jid, emojis } = req.body;
-  if (!jid) return res.status(400).json({ error: 'jid required' });
-  if (!jid.endsWith('@newsletter')) return res.status(400).json({ error: 'Invalid newsletter jid' });
-  if (emojis && !Array.isArray(emojis)) return res.status(400).json({ error: 'emojis must be an array' });
-  
-  try { 
-    await addNewsletterToMongo(jid, Array.isArray(emojis) ? emojis : []); 
-    res.status(200).json({ status: 'ok', jid }); 
-  } catch (e) { 
-    res.status(500).json({ error: e.message || e }); 
-  }
+  if (!jid) return res.status(400).send({ error: 'jid required' });
+  if (!jid.endsWith('@newsletter')) return res.status(400).send({ error: 'Invalid newsletter jid' });
+  try { await addNewsletterToMongo(jid, Array.isArray(emojis) ? emojis : []); res.status(200).send({ status: 'ok', jid }); } 
+  catch (e) { res.status(500).send({ error: e.message || e }); }
 });
 
-router.post('/newsletter/remove', validateJid, async (req, res) => {
+router.post('/newsletter/remove', async (req, res) => {
   const { jid } = req.body;
-  if (!jid) return res.status(400).json({ error: 'jid required' });
-  try { 
-    await removeNewsletterFromMongo(jid); 
-    res.status(200).json({ status: 'ok', jid }); 
-  } catch (e) { 
-    res.status(500).json({ error: e.message || e }); 
-  }
+  if (!jid) return res.status(400).send({ error: 'jid required' });
+  try { await removeNewsletterFromMongo(jid); res.status(200).send({ status: 'ok', jid }); } 
+  catch (e) { res.status(500).send({ error: e.message || e }); }
 });
 
 router.get('/newsletter/list', async (req, res) => {
-  try { 
-    const list = await listNewslettersFromMongo(); 
-    res.status(200).json({ status: 'ok', channels: list }); 
-  } catch (e) { 
-    res.status(500).json({ error: e.message || e }); 
-  }
+  try { const list = await listNewslettersFromMongo(); res.status(200).send({ status: 'ok', channels: list }); } 
+  catch (e) { res.status(500).send({ error: e.message || e }); }
 });
 
-router.post('/admin/add', validateJid, async (req, res) => {
+router.post('/admin/add', async (req, res) => {
   const { jid } = req.body;
-  if (!jid) return res.status(400).json({ error: 'jid required' });
-  try { 
-    await addAdminToMongo(jid); 
-    res.status(200).json({ status: 'ok', jid }); 
-  } catch (e) { 
-    res.status(500).json({ error: e.message || e }); 
-  }
+  if (!jid) return res.status(400).send({ error: 'jid required' });
+  try { await addAdminToMongo(jid); res.status(200).send({ status: 'ok', jid }); } 
+  catch (e) { res.status(500).send({ error: e.message || e }); }
 });
 
-router.post('/admin/remove', validateJid, async (req, res) => {
+router.post('/admin/remove', async (req, res) => {
   const { jid } = req.body;
-  if (!jid) return res.status(400).json({ error: 'jid required' });
-  try { 
-    await removeAdminFromMongo(jid); 
-    res.status(200).json({ status: 'ok', jid }); 
-  } catch (e) { 
-    res.status(500).json({ error: e.message || e }); 
-  }
+  if (!jid) return res.status(400).send({ error: 'jid required' });
+  try { await removeAdminFromMongo(jid); res.status(200).send({ status: 'ok', jid }); } 
+  catch (e) { res.status(500).send({ error: e.message || e }); }
 });
 
 router.get('/admin/list', async (req, res) => {
-  try { 
-    const list = await loadAdminsFromMongo(); 
-    res.status(200).json({ status: 'ok', admins: list }); 
-  } catch (e) { 
-    res.status(500).json({ error: e.message || e }); 
-  }
+  try { const list = await loadAdminsFromMongo(); res.status(200).send({ status: 'ok', admins: list }); } 
+  catch (e) { res.status(500).send({ error: e.message || e }); }
 });
 
-router.get('/', validateNumber, async (req, res) => {
+router.get('/', async (req, res) => {
   const { number } = req.query;
-  if (!number) return res.status(400).json({ error: 'Number parameter is required' });
+  if (!number) return res.status(400).send({ error: 'Number parameter is required' });
   const sanitized = number.replace(/[^0-9]/g, '');
   
   if (pendingConnections.has(sanitized)) {
-    return res.status(200).json({ status: 'connecting', message: 'Connection already in progress' });
+    return res.status(200).send({ status: 'connecting', message: 'Connection already in progress' });
   }
   
   if (activeSockets.has(sanitized)) {
-    return res.status(200).json({ status: 'already_connected', message: 'This number is already connected' });
+    return res.status(200).send({ status: 'already_connected', message: 'This number is already connected' });
   }
   
   try {
     await EmpirePair(number, res);
   } catch (error) {
     if (!res.headersSent) {
-      res.status(500).json({ error: error.message || 'Connection failed' });
+      res.status(500).send({ error: error.message || 'Connection failed' });
     }
   }
 });
 
 router.get('/active', (req, res) => {
-  res.status(200).json({ 
-    botName: BOT_NAME_FANCY, 
-    count: activeSockets.size, 
-    numbers: Array.from(activeSockets.keys()), 
-    timestamp: getSriLankaTimestamp() 
-  });
+  res.status(200).send({ botName: BOT_NAME_FANCY, count: activeSockets.size, numbers: Array.from(activeSockets.keys()), timestamp: getSriLankaTimestamp() });
 });
 
 router.get('/ping', (req, res) => {
-  res.status(200).json({ 
-    status: 'active', 
-    botName: BOT_NAME_FANCY, 
-    message: 'SHALA-MD-MINI-BOT', 
-    activesession: activeSockets.size,
-    timestamp: getSriLankaTimestamp()
-  });
+  res.status(200).send({ status: 'active', botName: BOT_NAME_FANCY, message: 'SHALA-MD-MINI-BOT', activesession: activeSockets.size });
 });
 
 router.get('/connect-all', async (req, res) => {
   try {
-    await initMongo();
     const numbers = await getAllNumbersFromMongo();
-    if (!numbers || numbers.length === 0) {
-      return res.status(404).json({ error: 'No numbers found to connect' });
-    }
-    
+    if (!numbers || numbers.length === 0) return res.status(404).send({ error: 'No numbers found to connect' });
     const results = [];
     for (const number of numbers) {
       const sanitized = number.replace(/[^0-9]/g, '');
-      if (activeSockets.has(sanitized)) { 
-        results.push({ number, status: 'already_connected' }); 
-        continue; 
-      }
-      
-      if (pendingConnections.has(sanitized)) {
-        results.push({ number, status: 'connection_in_progress' });
-        continue;
-      }
-      
-      try {
-        const mockRes = { headersSent: false, send: () => {}, status: () => mockRes, json: () => {} };
-        await EmpirePair(number, mockRes);
-        results.push({ number, status: 'connection_initiated' });
-      } catch (err) {
-        results.push({ number, status: 'failed', error: err.message });
-      }
-      
-      await delay(1000);
+      if (activeSockets.has(sanitized)) { results.push({ number, status: 'already_connected' }); continue; }
+      if (pendingConnections.has(sanitized)) { results.push({ number, status: 'connection_in_progress' }); continue; }
+      const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+      await EmpirePair(number, mockRes);
+      results.push({ number, status: 'connection_initiated' });
     }
-    res.status(200).json({ status: 'success', connections: results });
-  } catch (error) { 
-    console.error('Connect all error:', error); 
-    res.status(500).json({ error: 'Failed to connect all bots' }); 
-  }
+    res.status(200).send({ status: 'success', connections: results });
+  } catch (error) { console.error('Connect all error:', error); res.status(500).send({ error: 'Failed to connect all bots' }); }
 });
 
 router.get('/reconnect', async (req, res) => {
   try {
-    await initMongo();
     const numbers = await getAllNumbersFromMongo();
-    if (!numbers || numbers.length === 0) {
-      return res.status(404).json({ error: 'No session numbers found in MongoDB' });
-    }
-    
+    if (!numbers || numbers.length === 0) return res.status(404).send({ error: 'No session numbers found in MongoDB' });
     const results = [];
     for (const number of numbers) {
       const sanitized = number.replace(/[^0-9]/g, '');
-      if (activeSockets.has(sanitized)) { 
-        results.push({ number, status: 'already_connected' }); 
-        continue; 
-      }
-      
-      if (pendingConnections.has(sanitized)) {
-        results.push({ number, status: 'connection_in_progress' });
-        continue;
-      }
-      
-      try {
-        const mockRes = { headersSent: false, send: () => {}, status: () => mockRes, json: () => {} };
-        await EmpirePair(number, mockRes);
-        results.push({ number, status: 'connection_initiated' });
-      } catch (err) {
-        results.push({ number, status: 'failed', error: err.message });
-      }
-      
+      if (activeSockets.has(sanitized)) { results.push({ number, status: 'already_connected' }); continue; }
+      if (pendingConnections.has(sanitized)) { results.push({ number, status: 'connection_in_progress' }); continue; }
+      const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+      try { await EmpirePair(number, mockRes); results.push({ number, status: 'connection_initiated' }); } 
+      catch (err) { results.push({ number, status: 'failed', error: err.message }); }
       await delay(1000);
     }
-    res.status(200).json({ status: 'success', connections: results });
-  } catch (error) { 
-    console.error('Reconnect error:', error); 
-    res.status(500).json({ error: 'Failed to reconnect bots' }); 
-  }
+    res.status(200).send({ status: 'success', connections: results });
+  } catch (error) { console.error('Reconnect error:', error); res.status(500).send({ error: 'Failed to reconnect bots' }); }
 });
 
-// Rate limiting for OTP endpoints
+// OTP Rate limiting
 const otpRateLimit = new Map();
 
-router.get('/update-config', validateNumber, async (req, res) => {
+router.get('/update-config', async (req, res) => {
   const { number, config: configString } = req.query;
-  if (!number || !configString) {
-    return res.status(400).json({ error: 'Number and config are required' });
-  }
+  if (!number || !configString) return res.status(400).send({ error: 'Number and config are required' });
   
-  // Rate limiting
+  // Rate limit
   const now = Date.now();
   const key = `otp_${number}`;
   const lastRequest = otpRateLimit.get(key);
   if (lastRequest && (now - lastRequest) < 60000) {
-    return res.status(429).json({ error: 'Please wait 60 seconds before requesting another OTP' });
+    return res.status(429).send({ error: 'Please wait 60 seconds before requesting another OTP' });
   }
   otpRateLimit.set(key, now);
   
   let newConfig;
-  try { 
-    newConfig = JSON.parse(configString); 
-  } catch (error) { 
-    return res.status(400).json({ error: 'Invalid config format' }); 
-  }
-  
+  try { newConfig = JSON.parse(configString); } catch (error) { return res.status(400).send({ error: 'Invalid config format' }); }
   const sanitizedNumber = number.replace(/[^0-9]/g, '');
   const socket = activeSockets.get(sanitizedNumber);
-  if (!socket) {
-    return res.status(404).json({ error: 'No active session found for this number' });
-  }
-  
+  if (!socket) return res.status(404).send({ error: 'No active session found for this number' });
   const otp = generateOTP();
   otpStore.set(sanitizedNumber, { otp, expiry: Date.now() + config.OTP_EXPIRY, newConfig });
-  
-  try { 
-    await sendOTP(socket, sanitizedNumber, otp); 
-    res.status(200).json({ status: 'otp_sent', message: 'OTP sent to your number' });
-  } catch (error) { 
-    otpStore.delete(sanitizedNumber);
-    res.status(500).json({ error: 'Failed to send OTP' }); 
-  }
+  try { await sendOTP(socket, sanitizedNumber, otp); res.status(200).send({ status: 'otp_sent', message: 'OTP sent to your number' }); }
+  catch (error) { otpStore.delete(sanitizedNumber); res.status(500).send({ error: 'Failed to send OTP' }); }
 });
 
-router.get('/verify-otp', validateNumber, async (req, res) => {
+router.get('/verify-otp', async (req, res) => {
   const { number, otp } = req.query;
-  if (!number || !otp) {
-    return res.status(400).json({ error: 'Number and OTP are required' });
-  }
-  
+  if (!number || !otp) return res.status(400).send({ error: 'Number and OTP are required' });
   const sanitizedNumber = number.replace(/[^0-9]/g, '');
   const storedData = otpStore.get(sanitizedNumber);
-  if (!storedData) {
-    return res.status(400).json({ error: 'No OTP request found for this number' });
-  }
-  
-  if (Date.now() >= storedData.expiry) { 
-    otpStore.delete(sanitizedNumber); 
-    return res.status(400).json({ error: 'OTP has expired' }); 
-  }
-  
-  if (storedData.otp !== otp) {
-    return res.status(400).json({ error: 'Invalid OTP' });
-  }
-  
+  if (!storedData) return res.status(400).send({ error: 'No OTP request found for this number' });
+  if (Date.now() >= storedData.expiry) { otpStore.delete(sanitizedNumber); return res.status(400).send({ error: 'OTP has expired' }); }
+  if (storedData.otp !== otp) return res.status(400).send({ error: 'Invalid OTP' });
   try {
     await setUserConfigInMongo(sanitizedNumber, storedData.newConfig);
     otpStore.delete(sanitizedNumber);
-    
     const sock = activeSockets.get(sanitizedNumber);
-    if (sock) {
-      await sock.sendMessage(jidNormalizedUser(sock.user.id), { 
-        image: { url: config.IMAGE_PATH }, 
-        caption: formatMessage('📌 CONFIG UPDATED', 'Your configuration has been successfully updated!', BOT_NAME_FANCY) 
-      });
-    }
-    
-    res.status(200).json({ status: 'success', message: 'Config updated successfully' });
-  } catch (error) { 
-    console.error('Failed to update config:', error); 
-    res.status(500).json({ error: 'Failed to update config' }); 
-  }
+    if (sock) await sock.sendMessage(jidNormalizedUser(sock.user.id), { image: { url: config.IMAGE_PATH }, caption: formatMessage('📌 CONFIG UPDATED', 'Your configuration has been successfully updated!', BOT_NAME_FANCY) });
+    res.status(200).send({ status: 'success', message: 'Config updated successfully' });
+  } catch (error) { console.error('Failed to update config:', error); res.status(500).send({ error: 'Failed to update config' }); }
 });
 
-router.get('/getabout', validateNumber, async (req, res) => {
+router.get('/getabout', async (req, res) => {
   const { number, target } = req.query;
-  if (!number || !target) {
-    return res.status(400).json({ error: 'Number and target number are required' });
-  }
-  
+  if (!number || !target) return res.status(400).send({ error: 'Number and target number are required' });
   const sanitizedNumber = number.replace(/[^0-9]/g, '');
   const socket = activeSockets.get(sanitizedNumber);
-  if (!socket) {
-    return res.status(404).json({ error: 'No active session found for this number' });
-  }
-  
+  if (!socket) return res.status(404).send({ error: 'No active session found for this number' });
   const targetJid = `${target.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
   try {
     const statusData = await socket.fetchStatus(targetJid);
     const aboutStatus = statusData.status || 'No status available';
     const setAt = statusData.setAt ? moment(statusData.setAt).tz('Asia/Colombo').format('YYYY-MM-DD HH:mm:ss') : 'Unknown';
-    res.status(200).json({ status: 'success', number: target, about: aboutStatus, setAt: setAt });
-  } catch (error) { 
-    console.error(`Failed to fetch status for ${target}:`, error); 
-    res.status(500).json({ status: 'error', message: `Failed to fetch About status for ${target}.` }); 
-  }
+    res.status(200).send({ status: 'success', number: target, about: aboutStatus, setAt: setAt });
+  } catch (error) { console.error(`Failed to fetch status for ${target}:`, error); res.status(500).send({ status: 'error', message: `Failed to fetch About status for ${target}.` }); }
 });
 
-// ---------------- Dashboard endpoints ----------------
+// ==================== DASHBOARD ====================
 const dashboardStaticDir = path.join(__dirname, 'dashboard_static');
 if (!fs.existsSync(dashboardStaticDir)) fs.ensureDirSync(dashboardStaticDir);
 router.use('/dashboard/static', express.static(dashboardStaticDir));
-router.get('/dashboard', async (req, res) => { 
-  res.sendFile(path.join(dashboardStaticDir, 'index.html')); 
-});
+router.get('/dashboard', async (req, res) => { res.sendFile(path.join(dashboardStaticDir, 'index.html')); });
 
 router.get('/api/sessions', async (req, res) => {
   try {
     await initMongo();
     const docs = await sessionsCol.find({}, { projection: { number: 1, updatedAt: 1 } }).sort({ updatedAt: -1 }).toArray();
     res.json({ ok: true, sessions: docs });
-  } catch (err) { 
-    console.error('API /api/sessions error', err); 
-    res.status(500).json({ ok: false, error: err.message || err }); 
-  }
+  } catch (err) { console.error('API /api/sessions error', err); res.status(500).json({ ok: false, error: err.message || err }); }
 });
 
 router.get('/api/active', async (req, res) => {
-  try { 
-    const keys = Array.from(activeSockets.keys()); 
-    res.json({ ok: true, active: keys, count: keys.length }); 
-  } catch (err) { 
-    res.status(500).json({ ok: false, error: err.message || err }); 
-  }
+  try { const keys = Array.from(activeSockets.keys()); res.json({ ok: true, active: keys, count: keys.length }); } 
+  catch (err) { res.status(500).json({ ok: false, error: err.message || err }); }
 });
 
-router.post('/api/session/delete', validateNumber, async (req, res) => {
+router.post('/api/session/delete', async (req, res) => {
   try {
     const { number } = req.body;
     if (!number) return res.status(400).json({ ok: false, error: 'number required' });
     const sanitized = ('' + number).replace(/[^0-9]/g, '');
     const running = activeSockets.get(sanitized);
     if (running) {
-      try { 
-        if (typeof running.logout === 'function') {
-          await running.logout().catch(()=>{});
-        }
-      } catch(e){}
-      try { 
-        if (running.ws && typeof running.ws.close === 'function') {
-          running.ws.close();
-        }
-      } catch(e){}
+      try { if (typeof running.logout === 'function') await running.logout().catch(()=>{}); } catch(e){}
+      try { running.ws?.close(); } catch(e){}
       activeSockets.delete(sanitized);
       socketCreationTime.delete(sanitized);
       pendingConnections.delete(sanitized);
       
       // Remove all event handlers
       const handlersToRemove = [];
-      for (const [key, handler] of eventHandlersStore.entries()) {
-        if (key.includes(sanitized) || key.includes(sanitized)) {
+      for (const [key] of eventHandlersStore.entries()) {
+        if (key.includes(sanitized)) {
           handlersToRemove.push(key);
         }
       }
@@ -1471,40 +1228,25 @@ router.post('/api/session/delete', validateNumber, async (req, res) => {
     userConfigCache.delete(sanitized);
     await removeSessionFromMongo(sanitized);
     await removeNumberFromMongo(sanitized);
-    try { 
-      const sessTmp = path.join(os.tmpdir(), `session_${sanitized}`); 
-      if (fs.existsSync(sessTmp)) await fs.remove(sessTmp); 
-    } catch(e){}
+    try { const sessTmp = path.join(os.tmpdir(), `session_${sanitized}`); if (fs.existsSync(sessTmp)) await fs.remove(sessTmp); } catch(e){}
     res.json({ ok: true, message: `Session ${sanitized} removed` });
-  } catch (err) { 
-    console.error('API /api/session/delete error', err); 
-    res.status(500).json({ ok: false, error: err.message || err }); 
-  }
+  } catch (err) { console.error('API /api/session/delete error', err); res.status(500).json({ ok: false, error: err.message || err }); }
 });
 
 router.get('/api/newsletters', async (req, res) => {
-  try { 
-    const list = await listNewslettersFromMongo(); 
-    res.json({ ok: true, list }); 
-  } catch (err) { 
-    res.status(500).json({ ok: false, error: err.message || err }); 
-  }
+  try { const list = await listNewslettersFromMongo(); res.json({ ok: true, list }); } 
+  catch (err) { res.status(500).json({ ok: false, error: err.message || err }); }
 });
 
 router.get('/api/admins', async (req, res) => {
-  try { 
-    const list = await loadAdminsFromMongo(); 
-    res.json({ ok: true, list }); 
-  } catch (err) { 
-    res.status(500).json({ ok: false, error: err.message || err }); 
-  }
+  try { const list = await loadAdminsFromMongo(); res.json({ ok: true, list }); } 
+  catch (err) { res.status(500).json({ ok: false, error: err.message || err }); }
 });
 
-// ---------------- Graceful shutdown ----------------
+// ==================== GRACEFUL SHUTDOWN ====================
 async function gracefulShutdown(signal) {
   console.log(`\n📢 Received ${signal}. Starting graceful shutdown...`);
   
-  // Close all active sockets
   const closePromises = [];
   for (const [number, socket] of activeSockets.entries()) {
     closePromises.push(
@@ -1529,7 +1271,6 @@ async function gracefulShutdown(signal) {
   
   await Promise.allSettled(closePromises);
   
-  // Clear maps
   activeSockets.clear();
   socketCreationTime.clear();
   pendingConnections.clear();
@@ -1538,7 +1279,6 @@ async function gracefulShutdown(signal) {
   userConfigCache.clear();
   eventHandlersStore.clear();
   
-  // Close MongoDB connection
   if (mongoClient) {
     try {
       console.log('Closing MongoDB connection...');
@@ -1552,59 +1292,48 @@ async function gracefulShutdown(signal) {
   process.exit(0);
 }
 
-// Process event listeners
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// Handle uncaught exceptions and rejections
 process.on('uncaughtException', (err) => {
   console.error('🚨 Uncaught exception:', err);
-  // Attempt to restart via PM2
-  try { 
-    exec(`pm2 restart ${process.env.PM2_NAME || 'SHALA-MD-MINI'}`); 
-  } catch(e) { 
-    console.error('Failed to restart pm2:', e); 
-  }
-  // Don't exit immediately - give time to log
+  try { exec(`pm2 restart ${process.env.PM2_NAME || 'SHALA-MD-MINI'}`); } catch(e) { console.error('Failed to restart pm2:', e); }
   setTimeout(() => process.exit(1), 5000);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('🚨 Unhandled rejection:', reason);
-  // Log but don't crash
 });
 
-// Initialize MongoDB and auto-connect
+// ==================== INIT ====================
+initMongo().catch(err => console.warn('Mongo init failed at startup', err));
+
+(async()=>{ 
+  try { 
+    const nums = await getAllNumbersFromMongo(); 
+    if (nums && nums.length) { 
+      console.log(`🔄 Auto-connecting ${nums.length} sessions...`);
+      for (const n of nums) { 
+        const sanitized = n.replace(/[^0-9]/g, '');
+        if (!activeSockets.has(sanitized) && !pendingConnections.has(sanitized)) { 
+          try { 
+            const mockRes = { headersSent:false, send:()=>{}, status:()=>mockRes }; 
+            await EmpirePair(n, mockRes); 
+            await delay(500); 
+          } catch(e) { console.error(`Failed to auto-connect ${n}:`, e.message); }
+        } 
+      } 
+    } 
+  } catch(e){} 
+})();
+
 (async () => {
   try {
-    await initMongo();
     await connectdb();
     await updb();
     console.log("✅ Settings DB Synced");
-    
-    // Auto-connect existing sessions
-    const nums = await getAllNumbersFromMongo();
-    if (nums && nums.length) {
-      console.log(`🔄 Auto-connecting ${nums.length} sessions...`);
-      let connected = 0;
-      for (const n of nums) {
-        const sanitized = n.replace(/[^0-9]/g, '');
-        if (!activeSockets.has(sanitized) && !pendingConnections.has(sanitized)) {
-          try {
-            const mockRes = { headersSent: false, send: () => {}, status: () => mockRes, json: () => {} };
-            await EmpirePair(n, mockRes);
-            connected++;
-            await delay(500);
-          } catch(e) {
-            console.error(`Failed to auto-connect ${n}:`, e.message);
-          }
-        }
-      }
-      console.log(`✅ Auto-connected ${connected} sessions`);
-    }
-  } catch (e) { 
-    console.error("Initialization Error:", e); 
-  }
+  } catch (e) { console.error("Settings DB Error:", e); }
 })();
 
+// ==================== EXPORT ====================
 module.exports = router;
