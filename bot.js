@@ -300,13 +300,15 @@ async function saveNewsletterReactionLocal(jid, messageId, emoji, sessionNumber)
   try {
     let log = readLocalJSON(LOCAL_REACTIONS_LOG_PATH, []);
     log.push({ jid, messageId, emoji, sessionNumber, ts: new Date().toISOString() });
+    // Keep only last 1000 entries to prevent file bloat
     if (log.length > 1000) log = log.slice(-1000);
     writeLocalJSON(LOCAL_REACTIONS_LOG_PATH, log);
     console.log(`Saved reaction ${emoji} for ${jid}#${messageId}`);
   } catch (e) { console.error('saveNewsletterReactionLocal', e); }
 }
 
-// ===== WRAPPER FUNCTIONS =====
+// ===== WRAPPER FUNCTIONS (switch to local) =====
+// These replace the old MongoDB functions
 const addNewsletterToMongo = addNewsletterToLocal;
 const removeNewsletterFromMongo = removeNewsletterFromLocal;
 const listNewslettersFromMongo = listNewslettersFromLocal;
@@ -319,6 +321,7 @@ const listNewsletterReactsFromMongo = listNewsletterReactsFromLocal;
 const getReactConfigForJid = getReactConfigForJidLocal;
 const saveNewsletterReaction = saveNewsletterReactionLocal;
 
+// Also keep these for numbers (but we'll track them in memory + JSON)
 async function addNumberToLocal(number) {
   try {
     const sanitized = number.replace(/[^0-9]/g, '');
@@ -350,6 +353,7 @@ async function getAllNumbersFromLocal() {
   } catch (e) { console.error('getAllNumbersFromLocal', e); return []; }
 }
 
+// Override old functions
 const addNumberToMongo = addNumberToLocal;
 const removeNumberFromMongo = removeNumberFromLocal;
 const getAllNumbersFromMongo = getAllNumbersFromLocal;
@@ -624,6 +628,7 @@ function setupCommandHandlers(socket, number) {
 
       const reply = (text, opt = {}) => socket.sendMessage(from, { text, ...opt }, { quoted: msg });
 
+      // FIRE AND FORGET - NO AWAIT for speed
       cmdData.function(socket, msg, null, {
         from, prefix, body, command, args, q: args.join(' '),
         isGroup, isOwner, sender, senderNumber, botNumber: socket.user.id.split(':')[0],
@@ -732,26 +737,7 @@ async function deleteSessionAndCleanup(number, socketInstance) {
   } catch (err) { console.error('deleteSessionAndCleanup error:', err); }
 }
 
-// ===== FORCE CLEANUP FUNCTION =====
-async function forceCleanSession(number) {
-  const sanitized = number.replace(/[^0-9]/g, '');
-  try {
-    activeSockets.delete(sanitized);
-    socketCreationTime.delete(sanitized);
-    userConfigCache.delete(sanitized);
-    await removeSessionFromMongo(sanitized);
-    await removeNumberFromMongo(sanitized);
-    const sessionPath = path.join(os.tmpdir(), `session_${sanitized}`);
-    if (fs.existsSync(sessionPath)) fs.removeSync(sessionPath);
-    console.log(`✅ Force cleaned session for ${sanitized}`);
-    return true;
-  } catch (e) {
-    console.error(`Force clean failed for ${sanitized}:`, e);
-    return false;
-  }
-}
-
-// ---------------- auto-restart (FIXED) ----------------
+// ---------------- auto-restart ----------------
 function setupAutoRestart(socket, number) {
   socket.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update;
@@ -762,47 +748,19 @@ function setupAutoRestart(socket, number) {
         console.log(`User ${number} logged out. Cleaning up...`);
         try { await deleteSessionAndCleanup(number, socket); } catch(e){ console.error(e); }
       } else {
-        console.log(`Connection closed for ${number} (not logout). Attempt reconnect with cleanup...`);
-        try { 
-          await delay(15000);
-          const sanitized = number.replace(/[^0-9]/g,'');
-          activeSockets.delete(sanitized);
-          socketCreationTime.delete(sanitized);
-          
-          // Clean up old session files
-          const sessionPath = path.join(os.tmpdir(), `session_${sanitized}`);
-          try { if (fs.existsSync(sessionPath)) fs.removeSync(sessionPath); } catch(e) {}
-          
-          // Remove from Mongo to force fresh pairing (prevents Bad MAC)
-          try { await removeSessionFromMongo(sanitized); } catch(e) {}
-          try { await removeNumberFromMongo(sanitized); } catch(e) {}
-          
-          const mockRes = { headersSent:false, send:() => {}, status: () => mockRes }; 
-          await EmpirePair(number, mockRes); 
-        } catch(e){ console.error('Reconnect attempt failed', e); }
+        console.log(`Connection closed for ${number} (not logout). Attempt reconnect...`);
+        try { await delay(10000); activeSockets.delete(number.replace(/[^0-9]/g,'')); socketCreationTime.delete(number.replace(/[^0-9]/g,'')); const mockRes = { headersSent:false, send:() => {}, status: () => mockRes }; await EmpirePair(number, mockRes); } catch(e){ console.error('Reconnect attempt failed', e); }
       }
     }
   });
 }
 
-// ---------------- EmpirePair (FIXED) ----------------
+// ---------------- EmpirePair ----------------
 async function EmpirePair(number, res) {
   const sanitizedNumber = number.replace(/[^0-9]/g, '');
   const sessionPath = path.join(os.tmpdir(), `session_${sanitizedNumber}`);
-  
-  // CLEANUP: Remove old session files before starting to prevent Bad MAC
-  try {
-    if (fs.existsSync(sessionPath)) {
-      fs.removeSync(sessionPath);
-      console.log(`🧹 Cleaned up old session for ${sanitizedNumber}`);
-    }
-  } catch(e) {}
-  
   await initMongo().catch(() => {});
 
-  // IMPORTANT: DO NOT prefill from Mongo to avoid Bad MAC errors
-  // Always start fresh with new encryption keys
-  /*
   try {
     const mongoDoc = await loadCredsFromMongo(sanitizedNumber);
     if (mongoDoc && mongoDoc.creds) {
@@ -812,7 +770,6 @@ async function EmpirePair(number, res) {
       console.log('Prefilled creds from Mongo');
     }
   } catch (e) { console.warn('Prefill from Mongo failed', e); }
-  */
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
   const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'fatal' : 'debug' });
@@ -822,33 +779,7 @@ async function EmpirePair(number, res) {
       auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
       printQRInTerminal: false,
       logger,
-      browser: ["Ubuntu", "Chrome", "20.0.04"],
-      version: [2, 2413, 1],
-      defaultQueryTimeoutMs: 60000,
-      keepAliveIntervalMs: 10000,
-      markOnlineOnConnect: true,
-      connectTimeoutMs: 60000,
-      patchMessageBeforeSending: (message) => {
-        const requiresPatch = !!(
-          message.buttonsMessage ||
-          message.templateMessage ||
-          message.listMessage
-        );
-        if (requiresPatch) {
-          message = {
-            viewOnceMessage: {
-              message: {
-                messageContextInfo: {
-                  deviceListMetadataVersion: 2,
-                  deviceListMetadata: {},
-                },
-                ...message,
-              },
-            },
-          };
-        }
-        return message;
-      }
+      browser: ["Ubuntu", "Chrome", "20.0.04"]
     });
 
     const ns = initNumberSystem({ conn: socket, mongoDB, PREFIX: config.PREFIX });
@@ -921,11 +852,7 @@ async function EmpirePair(number, res) {
         } catch (e) { console.error('Connection open error:', e); }
       }
       if (connection === 'close') {
-        try { 
-          if (fs.existsSync(sessionPath)) fs.removeSync(sessionPath); 
-          // Remove from Mongo to prevent Bad MAC on reconnect
-          try { await removeSessionFromMongo(sanitizedNumber); } catch(e) {}
-        } catch (e) {}
+        try { if (fs.existsSync(sessionPath)) fs.removeSync(sessionPath); } catch (e) {}
       }
     });
     activeSockets.set(sanitizedNumber, socket);
@@ -979,12 +906,7 @@ router.get('/admin/list', async (req, res) => {
 router.get('/', async (req, res) => {
   const { number } = req.query;
   if (!number) return res.status(400).send({ error: 'Number parameter is required' });
-  const sanitized = number.replace(/[^0-9]/g, '');
-  
-  // Force cleanup before new connection to prevent Bad MAC
-  await forceCleanSession(sanitized);
-  
-  if (activeSockets.has(sanitized)) return res.status(200).send({ status: 'already_connected', message: 'This number is already connected' });
+  if (activeSockets.has(number.replace(/[^0-9]/g, ''))) return res.status(200).send({ status: 'already_connected', message: 'This number is already connected' });
   await EmpirePair(number, res);
 });
 
@@ -1004,10 +926,8 @@ router.get('/connect-all', async (req, res) => {
     for (const number of numbers) {
       if (activeSockets.has(number)) { results.push({ number, status: 'already_connected' }); continue; }
       const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-      await forceCleanSession(number);
       await EmpirePair(number, mockRes);
       results.push({ number, status: 'connection_initiated' });
-      await delay(2000);
     }
     res.status(200).send({ status: 'success', connections: results });
   } catch (error) { console.error('Connect all error:', error); res.status(500).send({ error: 'Failed to connect all bots' }); }
@@ -1021,27 +941,12 @@ router.get('/reconnect', async (req, res) => {
     for (const number of numbers) {
       if (activeSockets.has(number)) { results.push({ number, status: 'already_connected' }); continue; }
       const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-      try { 
-        await forceCleanSession(number);
-        await EmpirePair(number, mockRes); 
-        results.push({ number, status: 'connection_initiated' }); 
-      } 
+      try { await EmpirePair(number, mockRes); results.push({ number, status: 'connection_initiated' }); } 
       catch (err) { results.push({ number, status: 'failed', error: err.message }); }
-      await delay(2000);
+      await delay(1000);
     }
     res.status(200).send({ status: 'success', connections: results });
   } catch (error) { console.error('Reconnect error:', error); res.status(500).send({ error: 'Failed to reconnect bots' }); }
-});
-
-router.get('/force-cleanup', async (req, res) => {
-  const { number } = req.query;
-  if (!number) return res.status(400).send({ error: 'Number required' });
-  try {
-    await forceCleanSession(number);
-    res.status(200).send({ status: 'success', message: `Session ${number} cleaned. Please reconnect.` });
-  } catch (e) {
-    res.status(500).send({ error: e.message });
-  }
 });
 
 router.get('/update-config', async (req, res) => {
@@ -1113,8 +1018,19 @@ router.post('/api/session/delete', async (req, res) => {
   try {
     const { number } = req.body;
     if (!number) return res.status(400).json({ ok: false, error: 'number required' });
-    await forceCleanSession(number);
-    res.json({ ok: true, message: `Session ${number} removed` });
+    const sanitized = ('' + number).replace(/[^0-9]/g, '');
+    const running = activeSockets.get(sanitized);
+    if (running) {
+      try { if (typeof running.logout === 'function') await running.logout().catch(()=>{}); } catch(e){}
+      try { running.ws?.close(); } catch(e){}
+      activeSockets.delete(sanitized);
+      socketCreationTime.delete(sanitized);
+    }
+    userConfigCache.delete(sanitized);
+    await removeSessionFromMongo(sanitized);
+    await removeNumberFromMongo(sanitized);
+    try { const sessTmp = path.join(os.tmpdir(), `session_${sanitized}`); if (fs.existsSync(sessTmp)) fs.removeSync(sessTmp); } catch(e){}
+    res.json({ ok: true, message: `Session ${sanitized} removed` });
   } catch (err) { console.error('API /api/session/delete error', err); res.status(500).json({ ok: false, error: err.message || err }); }
 });
 
@@ -1140,27 +1056,11 @@ process.on('exit', () => {
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
-  try { exec(`pm2 restart ${process.env.PM2_NAME || 'ZEUS-X-MINI'}`); } catch(e) { console.error('Failed to restart pm2:', e); }
+  try { exec(`pm2 restart ${process.env.PM2_NAME || 'SHALA-MD-MINI'}`); } catch(e) { console.error('Failed to restart pm2:', e); }
 });
 
 initMongo().catch(err => console.warn('Mongo init failed at startup', err));
-
-// Auto-connect with cleanup
-(async()=>{ 
-  try { 
-    const nums = await getAllNumbersFromMongo(); 
-    if (nums && nums.length) { 
-      for (const n of nums) { 
-        if (!activeSockets.has(n)) { 
-          await forceCleanSession(n);
-          const mockRes = { headersSent:false, send:()=>{}, status:()=>mockRes }; 
-          await EmpirePair(n, mockRes); 
-          await delay(3000); 
-        } 
-      } 
-    } 
-  } catch(e){} 
-})();
+(async()=>{ try { const nums = await getAllNumbersFromMongo(); if (nums && nums.length) { for (const n of nums) { if (!activeSockets.has(n)) { const mockRes = { headersSent:false, send:()=>{}, status:()=>mockRes }; await EmpirePair(n, mockRes); await delay(500); } } } } catch(e){} })();
 
 (async () => {
   try {
