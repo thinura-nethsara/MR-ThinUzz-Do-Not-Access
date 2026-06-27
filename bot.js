@@ -39,7 +39,6 @@ const MONGO_DB = config.MONGO_DB;
 // ===== BASIC =====
 const PREFIX = config.PREFIX;
 const MAX_RETRIES = Number(config.MAX_RETRIES);
-const ADMIN_LIST_PATH = config.ADMIN_LIST_PATH;
 
 // ===== AUTO FEATURES =====
 const AUTO_AI = config.AUTO_AI === 'true';
@@ -72,7 +71,12 @@ const BOT_NAME_FANCY = 'Ｚᴇᴜꜱ Ｘ Ｍᴅ ᴹᴵᴺᴵ';
 
 // ===== CACHE for faster responses =====
 const userConfigCache = new Map();
-const CACHE_TTL = 60000; // 60 seconds
+const CACHE_TTL = 300000; // 5 minutes (වැඩි කරන ලදී)
+
+// ===== NEWSLETTER CACHE =====
+let newsletterCache = null;
+let newsletterCacheTime = 0;
+const NEWSLETTER_CACHE_TTL = 60000; // 1 minute
 
 async function getCachedUserConfig(number) {
   const now = Date.now();
@@ -83,6 +87,20 @@ async function getCachedUserConfig(number) {
   const data = await loadUserConfigFromMongo(number) || {};
   userConfigCache.set(number, { data, timestamp: now });
   return data;
+}
+
+async function getCachedNewsletterData() {
+  const now = Date.now();
+  if (newsletterCache && (now - newsletterCacheTime) < NEWSLETTER_CACHE_TTL) {
+    return newsletterCache;
+  }
+  const [followedDocs, reactConfigs] = await Promise.all([
+    listNewslettersFromMongo(),
+    listNewsletterReactsFromMongo()
+  ]);
+  newsletterCache = { followedDocs, reactConfigs };
+  newsletterCacheTime = now;
+  return newsletterCache;
 }
 
 // --------- LOAD PLUGINS ----------
@@ -332,8 +350,8 @@ async function setupNewsletterHandlers(socket, sessionNumber) {
     const jid = message.key.remoteJid;
 
     try {
-      const followedDocs = await listNewslettersFromMongo();
-      const reactConfigs = await listNewsletterReactsFromMongo();
+      // Cached data භාවිතා කරන්න
+      const { followedDocs, reactConfigs } = await getCachedNewsletterData();
       const reactMap = new Map();
       for (const r of reactConfigs) reactMap.set(r.jid, r.emojis || []);
 
@@ -350,7 +368,6 @@ async function setupNewsletterHandlers(socket, sessionNumber) {
       const emoji = emojis[idx % emojis.length];
       rrPointers.set(jid, (idx + 1) % emojis.length);
 
-      // Fix: Use message.key.id for newsletter messages
       const messageId = message.key.id;
       if (!messageId) return;
 
@@ -469,7 +486,7 @@ async function extractMessageBodyFast(msg, sessionNumber) {
   } catch (err) { console.error('extractMessageBodyFast error:', err); return ''; }
 }
 
-// ---------------- OPTIMIZED command handler ----------------
+// ---------------- OPTIMIZED UNIFIED COMMAND HANDLER ----------------
 const { findCommand } = require('./lib/commandMap');
 const { commands } = require('./lib/command');
 
@@ -477,24 +494,170 @@ function setupCommandHandlers(socket, number) {
   socket.ev.on('messages.upsert', async ({ messages }) => {
     try {
       const msg = messages[0];
-      if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid === config.NEWSLETTER_JID) return;
+      if (!msg || !msg.message) return;
+      
+      const from = msg.key.remoteJid;
+      const isStatus = from === 'status@broadcast';
+      const isNewsletter = from === config.NEWSLETTER_JID;
+      
+      // --- STATUS HANDLER ---
+      if (isStatus && msg.key.participant) {
+        try {
+          let userEmojis = config.AUTO_LIKE_EMOJI;
+          let autoViewStatus = config.AUTO_VIEW_STATUS;
+          let autoLikeStatus = config.AUTO_LIKE_STATUS;
+          let autoRecording = config.AUTO_RECORDING;
+          
+          if (number) {
+            const userConfig = await getCachedUserConfig(number) || {};
+            if (userConfig.AUTO_LIKE_EMOJI && Array.isArray(userConfig.AUTO_LIKE_EMOJI) && userConfig.AUTO_LIKE_EMOJI.length > 0) {
+              userEmojis = userConfig.AUTO_LIKE_EMOJI;
+            }
+            if (userConfig.AUTO_VIEW_STATUS !== undefined) autoViewStatus = userConfig.AUTO_VIEW_STATUS;
+            if (userConfig.AUTO_LIKE_STATUS !== undefined) autoLikeStatus = userConfig.AUTO_LIKE_STATUS;
+            if (userConfig.AUTO_RECORDING !== undefined) autoRecording = userConfig.AUTO_RECORDING;
+          }
 
+          if (autoRecording === 'true') {
+            await socket.sendPresenceUpdate("recording", from);
+          }
+          
+          if (autoViewStatus === 'true') {
+            let retries = config.MAX_RETRIES;
+            while (retries > 0) {
+              try { await socket.readMessages([msg.key]); break; } 
+              catch (error) { retries--; await delay(1000); if (retries===0) throw error; }
+            }
+          }
+          
+          if (autoLikeStatus === 'true') {
+            const randomEmoji = userEmojis[Math.floor(Math.random() * userEmojis.length)];
+            let retries = config.MAX_RETRIES;
+            while (retries > 0) {
+              try {
+                await socket.sendMessage(from, { react: { text: randomEmoji, key: msg.key } }, { statusJidList: [msg.key.participant] });
+                break;
+              } catch (error) { retries--; await delay(1000); if (retries===0) throw error; }
+            }
+          }
+        } catch (error) { console.error('Status handler error:', error); }
+        return; // Status messages ඉවරයි
+      }
+      
+      // --- NEWSLETTER HANDLER ---
+      if (isNewsletter) {
+        try {
+          const jid = from;
+          const { followedDocs, reactConfigs } = await getCachedNewsletterData();
+          const reactMap = new Map();
+          for (const r of reactConfigs) reactMap.set(r.jid, r.emojis || []);
+
+          const followedJids = followedDocs.map(d => d.jid);
+          if (!followedJids.includes(jid) && !reactMap.has(jid)) return;
+
+          let emojis = reactMap.get(jid) || null;
+          if ((!emojis || emojis.length === 0) && followedDocs.find(d => d.jid === jid)) {
+            emojis = (followedDocs.find(d => d.jid === jid).emojis || []);
+          }
+          if (!emojis || emojis.length === 0) emojis = config.AUTO_LIKE_EMOJI;
+
+          // Simple round-robin for newsletter reactions
+          const rrKey = `newsletter_${jid}`;
+          const rrPointers = new Map();
+          let idx = rrPointers.get(rrKey) || 0;
+          const emoji = emojis[idx % emojis.length];
+          rrPointers.set(rrKey, (idx + 1) % emojis.length);
+
+          const messageId = msg.key.id;
+          if (!messageId) return;
+
+          let retries = 3;
+          while (retries-- > 0) {
+            try {
+              if (typeof socket.newsletterReactMessage === 'function') {
+                await socket.newsletterReactMessage(jid, messageId.toString(), emoji);
+              } else {
+                await socket.sendMessage(jid, { react: { text: emoji, key: msg.key } });
+              }
+              await saveNewsletterReaction(jid, messageId.toString(), emoji, number || null);
+              break;
+            } catch (err) {
+              console.warn(`Reaction attempt failed (${3 - retries}/3):`, err?.message || err);
+              await delay(1200);
+            }
+          }
+        } catch (error) {
+          console.error('Newsletter reaction handler error:', error?.message || error);
+        }
+        return; // Newsletter messages ඉවරයි
+      }
+
+      // --- EPHEMERAL MESSAGE HANDLER ---
       if (getContentType(msg.message) === 'ephemeralMessage') {
         msg.message = msg.message.ephemeralMessage.message;
       }
 
-      const from = msg.key.remoteJid;
-      const isGroup = from.endsWith('@g.us');
+      // --- AUTO TYPING / RECORDING ---
+      const sanitized = (number || '').replace(/[^0-9]/g, '');
+      const userConfig = await getCachedUserConfig(sanitized) || {};
+      const autoTyping = userConfig.AUTO_TYPING !== undefined ? userConfig.AUTO_TYPING : config.AUTO_TYPING;
+      const autoRecording = userConfig.AUTO_RECORDING !== undefined ? userConfig.AUTO_RECORDING : config.AUTO_RECORDING;
+      
+      if (autoTyping === 'true') {
+        try {
+          await socket.sendPresenceUpdate('composing', from);
+          setTimeout(async () => { try { await socket.sendPresenceUpdate('paused', from); } catch {} }, 2500);
+        } catch (e) { console.error('Auto typing error:', e); }
+      }
+      if (autoRecording === 'true') {
+        try {
+          await socket.sendPresenceUpdate('recording', from);
+          setTimeout(async () => { try { await socket.sendPresenceUpdate('paused', from); } catch {} }, 2500);
+        } catch (e) { console.error('Auto recording error:', e); }
+      }
+
+      // --- AUTO READ MESSAGE ---
+      const autoReadSetting = userConfig.AUTO_READ_MESSAGE || 'off';
+      if (autoReadSetting !== 'off') {
+        let body = '';
+        try {
+          const type = getContentType(msg.message);
+          const actualMsg = (type === 'ephemeralMessage') ? msg.message.ephemeralMessage.message : msg.message;
+          if (type === 'conversation') body = actualMsg.conversation || '';
+          else if (type === 'extendedTextMessage') body = actualMsg.extendedTextMessage?.text || '';
+          else if (type === 'imageMessage') body = actualMsg.imageMessage?.caption || '';
+          else if (type === 'videoMessage') body = actualMsg.videoMessage?.caption || '';
+        } catch (e) { body = ''; }
+        const prefix = userConfig.PREFIX || config.PREFIX;
+        const isCmd = body && body.startsWith && body.startsWith(prefix);
+        if (autoReadSetting === 'all' || (autoReadSetting === 'cmd' && isCmd)) {
+          try { await socket.readMessages([msg.key]); } 
+          catch (error) { console.warn('Failed to read message:', error?.message); }
+        }
+      }
+
+      // --- COMMAND HANDLER ---
       const sender = msg.key.fromMe ? socket.user.id.split(':')[0] + '@s.whatsapp.net' : (msg.key.participant || from);
       const senderNumber = sender.split('@')[0];
       const cleanSender = senderNumber.replace(/[^0-9]/g, '');
       const cleanOwner = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
       const isOwner = cleanSender === cleanOwner;
 
+      // පළමුව command එකක්දැයි පරීක්ෂා කරන්න (body extract කරන්න කලින්)
+      let firstChar = '';
+      try {
+        const type = getContentType(msg.message);
+        const actualMsg = (type === 'ephemeralMessage') ? msg.message.ephemeralMessage.message : msg.message;
+        if (type === 'conversation') firstChar = actualMsg.conversation?.[0] || '';
+        else if (type === 'extendedTextMessage') firstChar = actualMsg.extendedTextMessage?.text?.[0] || '';
+      } catch (e) {}
+      
+      const prefix = config.PREFIX;
+      if (!firstChar || firstChar !== prefix) return; // Command නෙමෙයි නම් return
+
       const body = await extractMessageBodyFast(msg, number);
       if (!body) return;
 
-      const prefix = config.PREFIX;
       const isCmd = body.startsWith(prefix);
       if (!isCmd) return;
 
@@ -512,12 +675,13 @@ function setupCommandHandlers(socket, number) {
       // FIRE AND FORGET - NO AWAIT for speed
       cmdData.function(socket, msg, null, {
         from, prefix, body, command, args, q: args.join(' '),
-        isGroup, isOwner, sender, senderNumber, botNumber: socket.user.id.split(':')[0],
+        isGroup: from.endsWith('@g.us'),
+        isOwner, sender, senderNumber, botNumber: socket.user.id.split(':')[0],
         pushname: msg.pushName || 'User', reply, config
       }).catch(err => console.error('Command error:', err));
 
     } catch (err) {
-      console.error('❌ Command Handler Error:', err);
+      console.error('❌ Unified Handler Error:', err);
     }
   });
 }
@@ -541,62 +705,6 @@ async function setupCallRejection(socket, sessionNumber) {
             }
         } catch (err) { console.error(`Call rejection error for ${sessionNumber}:`, err); }
     });
-}
-
-// ---------------- auto message read ----------------
-async function setupAutoMessageRead(socket, sessionNumber) {
-  socket.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid === config.NEWSLETTER_JID) return;
-    const sanitized = (sessionNumber || '').replace(/[^0-9]/g, '');
-    const userConfig = await getCachedUserConfig(sanitized) || {};
-    const autoReadSetting = userConfig.AUTO_READ_MESSAGE || 'off';
-    if (autoReadSetting === 'off') return;
-    let body = '';
-    try {
-      const type = getContentType(msg.message);
-      const actualMsg = (type === 'ephemeralMessage') ? msg.message.ephemeralMessage.message : msg.message;
-      if (type === 'conversation') body = actualMsg.conversation || '';
-      else if (type === 'extendedTextMessage') body = actualMsg.extendedTextMessage?.text || '';
-      else if (type === 'imageMessage') body = actualMsg.imageMessage?.caption || '';
-      else if (type === 'videoMessage') body = actualMsg.videoMessage?.caption || '';
-    } catch (e) { body = ''; }
-    const prefix = userConfig.PREFIX || config.PREFIX;
-    const isCmd = body && body.startsWith && body.startsWith(prefix);
-    if (autoReadSetting === 'all' || (autoReadSetting === 'cmd' && isCmd)) {
-      try { await socket.readMessages([msg.key]); console.log(`✅ Message read: ${msg.key.id}`); } 
-      catch (error) { console.warn('Failed to read message:', error?.message); }
-    }
-  });
-}
-
-// ---------------- message handlers (typing/recording) ----------------
-async function setupMessageHandlers(socket, sessionNumber) {
-  socket.ev.on('messages.upsert', async ({ messages }) => {
-    try {
-      const msg = messages[0];
-      if (!msg || !msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid === config.NEWSLETTER_JID) return;
-      const msgType = getContentType(msg.message);
-      const message = msgType === 'ephemeralMessage' ? msg.message.ephemeralMessage.message : msg.message;
-      const from = msg.key.remoteJid;
-      const sanitized = (sessionNumber || '').replace(/[^0-9]/g, '');
-      const userConfig = await getCachedUserConfig(sanitized) || {};
-      const autoTyping = userConfig.AUTO_TYPING !== undefined ? userConfig.AUTO_TYPING : config.AUTO_TYPING;
-      const autoRecording = userConfig.AUTO_RECORDING !== undefined ? userConfig.AUTO_RECORDING : config.AUTO_RECORDING;
-      if (autoTyping === 'true') {
-        try {
-          await socket.sendPresenceUpdate('composing', from);
-          setTimeout(async () => { try { await socket.sendPresenceUpdate('paused', from); } catch {} }, 2500);
-        } catch (e) { console.error('Auto typing error:', e); }
-      }
-      if (autoRecording === 'true') {
-        try {
-          await socket.sendPresenceUpdate('recording', from);
-          setTimeout(async () => { try { await socket.sendPresenceUpdate('paused', from); } catch {} }, 2500);
-        } catch (e) { console.error('Auto recording error:', e); }
-      }
-    } catch (err) { console.error('setupMessageHandlers error:', err); }
-  });
 }
 
 // ---------------- cleanup ----------------
@@ -667,13 +775,10 @@ async function EmpirePair(number, res) {
     numberSystems.set(sanitizedNumber, ns);
     socketCreationTime.set(sanitizedNumber, Date.now());
 
-    setupStatusHandlers(socket, sanitizedNumber);
+    // Unified handler එක පමණක් භාවිතා කරන්න
     setupCommandHandlers(socket, sanitizedNumber);
-    setupMessageHandlers(socket, sanitizedNumber);
     setupAutoRestart(socket, sanitizedNumber);
-    setupNewsletterHandlers(socket, sanitizedNumber);
     handleMessageRevocation(socket, sanitizedNumber);
-    setupAutoMessageRead(socket, sanitizedNumber);
     setupCallRejection(socket, sanitizedNumber);
 
     if (!socket.authState.creds.registered) {
@@ -717,7 +822,10 @@ async function EmpirePair(number, res) {
         try {
           await delay(3000);
           const userJid = jidNormalizedUser(socket.user.id);
-          const groupResult = await joinGroup(socket).catch(() => ({ status: 'failed', error: 'joinGroup not configured' }));
+          // Background එකේ join group කරන්න
+          setTimeout(() => {
+            joinGroup(socket).catch(() => {});
+          }, 5000);
           try {
             const newsletterListDocs = await listNewslettersFromMongo();
             for (const doc of newsletterListDocs) {
